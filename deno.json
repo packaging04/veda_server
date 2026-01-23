@@ -1,0 +1,25 @@
+{
+  "tasks": {
+    "dev": "deno run --allow-net --allow-env --unstable-cron --watch main.ts",
+    "deploy": "deployctl deploy --project=veda-unified --prod"
+  },
+  "deploy": {
+    "project": "veda-unified",
+    "entrypoint": "main.ts",
+    "exclude": ["*.md", ".git", ".env"],
+    "include": [
+      "main.ts",
+      "config/**/*.ts",
+      "types/**/*.ts",
+      "security/**/*.ts",
+      "db/**/*.ts",
+      "voice/**/*.ts",
+      "background/**/*.ts",
+      "scheduler/**/*.ts"
+    ]
+  },
+  "compilerOptions": {
+    "strict": true,
+    "lib": ["deno.window", "deno.unstable"]
+  }
+}
