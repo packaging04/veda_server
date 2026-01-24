@@ -18,6 +18,7 @@ export async function handleVoiceCallback(
   correlationId: string,
 ): Promise<Response> {
   try {
+    console.log("📞 CALLBACK HIT", new Date().toISOString());
     const formData = await req.formData();
     const url = new URL(req.url);
 
@@ -72,7 +73,7 @@ export async function handleVoiceCallback(
     let session = activeSessions.get(sessionId);
 
     if (!session) {
-      console.log(`✨ [${correlationId}] New session`);
+      console.log(`[${correlationId}] New session`);
 
       const callDetails = await fetchCallDetails(
         scheduledCallId,
