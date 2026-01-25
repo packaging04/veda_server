@@ -48,14 +48,14 @@ Deno.serve(async (req: Request) => {
   if (req.method === "GET" && url.pathname === "/voice") {
     return new Response(
       `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say voice="woman">
-    Hello. This is Veda calling. Your voice system is now working.
-  </Say>
-  <GetDigits timeout="10" numDigits="1">
-    <Say>Press one to continue.</Say>
-  </GetDigits>
-</Response>`,
+      <Response>
+        <GetDigits timeout="10" numDigits="1">
+          <Say>Press one to continue.</Say>
+          <Say voice="woman">
+            Hello. This is Veda calling. Your voice system is now working.
+          </Say>
+        </GetDigits>
+      </Response>`,
       {
         status: 200,
         headers: {
