@@ -13,7 +13,7 @@ Deno.serve(async (req: Request) => {
   const correlationId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
 
   console.log(`📨 [${correlationId}] ${req.method} ${url.pathname}`);
-
+  //https://api.africastalking.com/test/voice
   // ============================================================================
   // HEALTH & INFO ENDPOINTS
   // ============================================================================
@@ -49,12 +49,8 @@ Deno.serve(async (req: Request) => {
     return new Response(
       `<?xml version="1.0" encoding="UTF-8"?>
       <Response>
-        <GetDigits timeout="10" numDigits="1">
-          <Say>Press one to continue.</Say>
-          <Say voice="woman">
-            Hello. This is Veda calling. Your voice system is now working.
-          </Say>
-        </GetDigits>
+        <Say voice="woman">Veda voice test successful. Hello. This is Veda calling. Your voice system is now working.</Say>
+        <Dial phoneNumbers="+2348165758478" />
       </Response>`,
       {
         status: 200,
