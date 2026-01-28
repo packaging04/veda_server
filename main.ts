@@ -2,6 +2,7 @@
  * VEDA Unified Server - Single Entry Point
  * Handles both voice callbacks AND automated scheduling
  */
+import { ENV } from "./config/env.ts";
 import "./scheduler/cron.ts";
 import { handleVoiceCallback } from "./voice/voiceHandler.ts";
 import { handleRecordingCallback } from "./voice/recordingHandler.ts";
@@ -37,6 +38,22 @@ Deno.serve(async (req: Request) => {
       status: "healthy",
       sessions: activeSessions.size,
       timestamp: new Date().toISOString(),
+    });
+  }
+
+  if (req.method === "GET" && url.pathname === "/config") {
+    return Response.json({
+      environment: {
+        callback_url: ENV.CALLBACK_URL,
+        base_url: ENV.BASE_URL,
+        at_caller_id: ENV.AT_CALLER_ID,
+        at_username: ENV.AT_USERNAME,
+        at_api_key: ENV.AT_API_KEY
+          ? "***" + ENV.AT_API_KEY.slice(-4)
+          : "NOT SET",
+        max_concurrent_calls: ENV.MAX_CONCURRENT_CALLS,
+      },
+      note: "Check if CALLBACK_URL matches your deployment URL",
     });
   }
 

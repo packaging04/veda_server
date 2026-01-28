@@ -1,5 +1,5 @@
 /**
- * Voice Callback Handler
+ * Voice Callback Handler - Enhanced with debugging
  */
 
 import { ENV } from "../config/env.ts";
@@ -19,13 +19,26 @@ export async function handleVoiceCallback(
 ): Promise<Response> {
   try {
     console.log("📞 CALLBACK HIT", new Date().toISOString());
+
     const formData = await req.formData();
     const url = new URL(req.url);
+
+    // Log all incoming data for debugging
+    console.log(`🔍 [${correlationId}] URL:`, url.toString());
+    console.log(
+      `🔍 [${correlationId}] Query params:`,
+      Object.fromEntries(url.searchParams),
+    );
+    console.log(
+      `🔍 [${correlationId}] Form data:`,
+      Object.fromEntries(formData),
+    );
 
     const sessionId = formData.get("sessionId") as string;
     const isActive = formData.get("isActive") as string;
 
     if (!sessionId) {
+      console.error(`❌ [${correlationId}] Missing sessionId in form data`);
       return errorResponse("Missing session");
     }
 
@@ -54,8 +67,14 @@ export async function handleVoiceCallback(
     const scheduledCallId = url.searchParams.get("scheduledCallId");
 
     if (!scheduledCallId) {
-      console.error(`❌ [${correlationId}] Missing scheduledCallId`);
-      return errorResponse("Invalid call");
+      console.error(`❌ [${correlationId}] Missing scheduledCallId in URL`);
+      console.error(
+        `❌ [${correlationId}] This means the call was not initiated with the scheduledCallId parameter`,
+      );
+      console.error(
+        `❌ [${correlationId}] Check your makeCall function in processor.ts`,
+      );
+      return errorResponse("Invalid call - missing identifier");
     }
 
     // IDEMPOTENCY CHECK
@@ -73,7 +92,7 @@ export async function handleVoiceCallback(
     let session = activeSessions.get(sessionId);
 
     if (!session) {
-      console.log(`[${correlationId}] New session`);
+      console.log(`✨ [${correlationId}] New session - fetching call details`);
 
       const callDetails = await fetchCallDetails(
         scheduledCallId,
@@ -81,8 +100,15 @@ export async function handleVoiceCallback(
       );
 
       if (!callDetails) {
+        console.error(
+          `❌ [${correlationId}] Call not found in database: ${scheduledCallId}`,
+        );
         return errorResponse("Call not found");
       }
+
+      console.log(
+        `✅ [${correlationId}] Call details found for ${hashPii(callDetails.lovedOneName)}`,
+      );
 
       session = {
         sessionId,
@@ -116,16 +142,19 @@ export async function handleVoiceCallback(
       );
 
       console.log(
-        `📞 [${correlationId}] Session created for ${hashPii(callDetails.lovedOneName)}`,
+        `📞 [${correlationId}] Session created for ${hashPii(callDetails.lovedOneName)} with ${session.questions.length} questions`,
       );
     } else {
       session.lastActivity = new Date().toISOString();
+      console.log(`🔄 [${correlationId}] Existing session updated`);
     }
 
     const actions: AfricasTalkingAction[] = [];
 
     // Greeting
     if (session.currentQuestionIndex === 0) {
+      console.log(`👋 [${correlationId}] Sending greeting`);
+
       actions.push({
         say: {
           text: `Hello ${session.lovedOneName}. This is Veda, calling to help preserve your precious memories for your family. This call will be recorded. Are you ready to share your stories?`,
@@ -152,7 +181,7 @@ export async function handleVoiceCallback(
       const currentQ = session.questions[session.currentQuestionIndex];
 
       console.log(
-        `❓ [${correlationId}] Q${session.currentQuestionIndex + 1}/${session.questions.length}`,
+        `❓ [${correlationId}] Asking Q${session.currentQuestionIndex + 1}/${session.questions.length}: ${currentQ.text.substring(0, 50)}...`,
       );
 
       actions.push({
@@ -177,8 +206,6 @@ export async function handleVoiceCallback(
           callbackUrl,
         },
       });
-
-      // Don't increment here - atomic advancement in recording handler
 
       await logEvent(
         scheduledCallId,
@@ -210,17 +237,24 @@ export async function handleVoiceCallback(
       setTimeout(() => activeSessions.delete(sessionId), 10000);
     }
 
-    return new Response(buildVoiceXML(actions), {
+    const xmlResponse = buildVoiceXML(actions);
+    console.log(
+      `📤 [${correlationId}] Sending XML response (${xmlResponse.length} chars)`,
+    );
+
+    return new Response(xmlResponse, {
       status: 200,
       headers: { "Content-Type": "text/xml" },
     });
   } catch (error) {
     console.error(`❌ [${correlationId}] Voice error:`, error);
+    // console.error(`❌ [${correlationId}] Stack:`, error.stack);
     return errorResponse("Technical difficulty");
   }
 }
 
 function errorResponse(message: string): Response {
+  console.log(`⚠️  Sending error response: ${message}`);
   return new Response(
     buildVoiceXML([
       {
