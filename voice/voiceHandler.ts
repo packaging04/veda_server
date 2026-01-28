@@ -158,7 +158,7 @@ export async function handleVoiceCallback(
       actions.push({
         say: {
           text: `Hello ${session.lovedOneName}. This is Veda, calling to help preserve your precious memories for your family. This call will be recorded. Are you ready to share your stories?`,
-          voice: "female",
+          voice: "woman",
           playBeep: false,
         },
       });
@@ -168,7 +168,7 @@ export async function handleVoiceCallback(
       actions.push({
         say: {
           text: "Let's begin.",
-          voice: "female",
+          voice: "woman",
           playBeep: false,
         },
       });
@@ -187,7 +187,7 @@ export async function handleVoiceCallback(
       actions.push({
         say: {
           text: currentQ.text,
-          voice: "female",
+          voice: "woman",
           playBeep: false,
         },
       });
@@ -222,7 +222,7 @@ export async function handleVoiceCallback(
       actions.push({
         say: {
           text: `Thank you so much for sharing these beautiful memories, ${session.lovedOneName}. Your stories will be treasured for generations. Goodbye.`,
-          voice: "female",
+          voice: "woman",
           playBeep: false,
         },
       });
@@ -260,7 +260,7 @@ function errorResponse(message: string): Response {
       {
         say: {
           text: `I apologize, but we're experiencing ${message}. Please try again later. Goodbye.`,
-          voice: "female",
+          voice: "woman",
         },
       },
     ]),

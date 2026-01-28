@@ -142,7 +142,7 @@ function errorXml(message: string): Response {
       {
         say: {
           text: `An error occurred: ${message}. Continuing.`,
-          voice: "female",
+          voice: "woman",
         },
       },
     ]),

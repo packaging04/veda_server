@@ -24,7 +24,7 @@ export interface CallSession {
 export interface AfricasTalkingAction {
   say?: {
     text: string;
-    voice: "male" | "female";
+    voice: "male" | "female" | "woman";
     playBeep?: boolean;
   };
   record?: {
