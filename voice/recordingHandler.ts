@@ -112,7 +112,7 @@ export async function handleRecordingCallback(
         console.error(`❌ [${correlationId}] Background upload failed:`, err);
       });
 
-      // ATOMIC: Increment only after successful download
+      // ATOMIC: Increment only after successful download NOTHING
       session.currentQuestionIndex = qIndex + 1;
       session.lastActivity = new Date().toISOString();
       activeSessions.set(sessionId, session);
