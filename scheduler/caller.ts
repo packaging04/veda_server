@@ -35,7 +35,6 @@ export async function makeCall(dueCall: DueCall): Promise<boolean> {
 
     const body = new URLSearchParams({
       username: ENV.AT_USERNAME,
-      // to: dueCall.loved_one_phone,
       to: [dueCall.loved_one_phone].join(","),
       // from: ENV.AT_CALLER_ID,
       callbackUrl,
