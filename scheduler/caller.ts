@@ -29,7 +29,7 @@ export async function makeCall(dueCall: DueCall): Promise<boolean> {
 
     // 🔍 Debug logging
     console.log(`🔍 Callback URL: ${callbackUrl}`);
-    console.log(`🔍 From: ${ENV.AT_CALLER_ID}`);
+    // console.log(`🔍 From: ${ENV.AT_CALLER_ID}`);
     console.log(`🔍 To: ${dueCall.loved_one_phone}`);
     console.log(`🔍 Username: ${ENV.AT_USERNAME}`);
 
@@ -37,7 +37,7 @@ export async function makeCall(dueCall: DueCall): Promise<boolean> {
       username: ENV.AT_USERNAME,
       // to: dueCall.loved_one_phone,
       to: [dueCall.loved_one_phone].join(","),
-      from: ENV.AT_CALLER_ID,
+      // from: ENV.AT_CALLER_ID,
       callbackUrl,
     });
 
