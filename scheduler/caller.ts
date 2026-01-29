@@ -29,14 +29,14 @@ export async function makeCall(dueCall: DueCall): Promise<boolean> {
 
     // 🔍 Debug logging
     console.log(`🔍 Callback URL: ${callbackUrl}`);
-    console.log(`🔍 To: ${ENV.AT_CALLER_ID}`);
-    console.log(`🔍 From: ${dueCall.loved_one_phone}`);
+    console.log(`🔍 From: ${ENV.AT_CALLER_ID}`);
+    console.log(`🔍 To: ${dueCall.loved_one_phone}`);
     console.log(`🔍 Username: ${ENV.AT_USERNAME}`);
 
     const body = new URLSearchParams({
       username: ENV.AT_USERNAME,
-      to: ENV.AT_CALLER_ID,
-      from: dueCall.loved_one_phone,
+      to: dueCall.loved_one_phone,
+      from: ENV.AT_CALLER_ID,
       callbackUrl,
     });
 
