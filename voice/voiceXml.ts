@@ -1,5 +1,6 @@
 /**
- * Voice XML Builder
+ * Voice XML Builder — Africa's Talking compatible
+ * NOTE: AT does NOT support <Pause>. Removed entirely.
  */
 
 import { AfricasTalkingAction } from "../types/voice.ts";
@@ -25,9 +26,8 @@ export function buildVoiceXML(actions: AfricasTalkingAction[]): string {
       xml += `>${escapeXml(action.say.text)}</Say>\n`;
     }
 
-    if (action.pause) {
-      xml += `  <Pause length="${action.pause.length}" />\n`;
-    }
+    // <Pause> is NOT supported by Africa's Talking — skip silently
+    // if (action.pause) { ... }
 
     if (action.record) {
       xml += `  <Record`;
