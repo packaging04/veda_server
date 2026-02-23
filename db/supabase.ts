@@ -1,25 +1,16 @@
-/**
- * Supabase Database Operations
- */
-
 import { ENV } from "../config/env.ts";
-import { Question } from "../types/voice.ts";
+import { UserProfile, ConversationTurn } from "../types/voice.ts";
 
-export async function fetchCallDetails(
-  scheduledCallId: string,
+// ─── USER IDENTIFICATION ──────────────────────────────────────────────────────
+
+export async function lookupUserByPhone(
+  phoneNumber: string,
   correlationId: string,
-): Promise<{
-  userId: string;
-  lovedOneId: string;
-  lovedOneName: string;
-  phoneNumber: string;
-  questions: Question[];
-} | null> {
+): Promise<UserProfile | null> {
   try {
-    console.log(`🔍 [${correlationId}] Fetching call: ${scheduledCallId}`);
-
-    const callResponse = await fetch(
-      `${ENV.SUPABASE_URL}/rest/v1/scheduled_calls?id=eq.${scheduledCallId}&select=user_id,loved_one_id,interview_session_id,loved_ones(name,phone)`,
+    const now = new Date().toISOString();
+    const response = await fetch(
+      `${ENV.SUPABASE_URL}/rest/v1/inbound_call_windows?phone_number=eq.${encodeURIComponent(phoneNumber)}&window_start=lte.${now}&window_end=gte.${now}&select=user_id,users(id,full_name,user_type,company_name,role_title,industry,family_context,additional_context,access_code)`,
       {
         headers: {
           apikey: ENV.SUPABASE_SERVICE_KEY,
@@ -28,115 +19,203 @@ export async function fetchCallDetails(
       },
     );
 
-    if (!callResponse.ok) return null;
+    if (!response.ok) return null;
+    const windows = await response.json();
+    if (!windows.length || !windows[0].users) return null;
 
-    const calls = await callResponse.json();
-    if (calls.length === 0) return null;
-
-    const call = calls[0];
-    const lovedOne = call.loved_ones;
-
-    // Get questions
-    const questionsResponse = await fetch(
-      `${ENV.SUPABASE_URL}/rest/v1/call_questions?call_id=eq.${scheduledCallId}&select=id,question_order,custom_question_text,questions(question_text)&order=question_order.asc`,
-      {
-        headers: {
-          apikey: ENV.SUPABASE_SERVICE_KEY,
-          Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
-        },
-      },
+    const profile = mapToUserProfile(windows[0].users);
+    profile.totalQuestionsAsked = await getTotalQuestionsAsked(
+      profile.userId,
+      correlationId,
     );
-
-    let questions: Question[] = [];
-
-    if (questionsResponse.ok) {
-      const callQuestions = await questionsResponse.json();
-      questions = callQuestions.map((cq: any) => ({
-        id: cq.id,
-        text:
-          cq.custom_question_text ||
-          cq.questions?.question_text ||
-          "Tell me about your life.",
-        order: cq.question_order,
-      }));
-    }
-
-    // Try interview_session questions if no direct questions
-    if (questions.length === 0 && call.interview_session_id) {
-      const sessionQuestionsResponse = await fetch(
-        `${ENV.SUPABASE_URL}/rest/v1/call_questions?interview_session_id=eq.${call.interview_session_id}&select=id,question_order,custom_question_text,questions(question_text)&order=question_order.asc`,
-        {
-          headers: {
-            apikey: ENV.SUPABASE_SERVICE_KEY,
-            Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
-          },
-        },
-      );
-
-      if (sessionQuestionsResponse.ok) {
-        const sessionQuestions = await sessionQuestionsResponse.json();
-        questions = sessionQuestions.map((sq: any) => ({
-          id: sq.id,
-          text:
-            sq.custom_question_text ||
-            sq.questions?.question_text ||
-            "Tell me about your life.",
-          order: sq.question_order,
-        }));
-      }
-    }
-
-    // Fallback
-    if (questions.length === 0) {
-      questions = [
-        {
-          id: "default-1",
-          text: "Tell me about a memorable moment in your life.",
-          order: 0,
-        },
-      ];
-    }
-
-    console.log(`✅ [${correlationId}] Loaded ${questions.length} questions`);
-
-    return {
-      userId: call.user_id,
-      lovedOneId: call.loved_one_id,
-      lovedOneName: lovedOne.name,
-      phoneNumber: lovedOne.phone,
-      questions,
-    };
+    console.log(
+      `✅ [${correlationId}] Identified by phone. Past questions: ${profile.totalQuestionsAsked}`,
+    );
+    return profile;
   } catch (error) {
-    console.error(`❌ [${correlationId}] Error fetching call:`, error);
+    console.error(`❌ [${correlationId}] Phone lookup error:`, error);
     return null;
   }
 }
 
-export async function updateCallStatus(
-  scheduledCallId: string,
-  status: string,
-  sessionId: string | null,
+export async function lookupUserByCode(
+  code: string,
+  correlationId: string,
+): Promise<UserProfile | null> {
+  try {
+    const cleanCode = code.replace(/\s+/g, "").toUpperCase();
+    const response = await fetch(
+      `${ENV.SUPABASE_URL}/rest/v1/users?access_code=eq.${encodeURIComponent(cleanCode)}&select=id,full_name,user_type,company_name,role_title,industry,family_context,additional_context,access_code`,
+      {
+        headers: {
+          apikey: ENV.SUPABASE_SERVICE_KEY,
+          Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
+        },
+      },
+    );
+
+    if (!response.ok) return null;
+    const users = await response.json();
+    if (!users.length) return null;
+
+    const profile = mapToUserProfile(users[0]);
+    profile.totalQuestionsAsked = await getTotalQuestionsAsked(
+      profile.userId,
+      correlationId,
+    );
+    console.log(
+      `✅ [${correlationId}] Identified by code. Past questions: ${profile.totalQuestionsAsked}`,
+    );
+    return profile;
+  } catch (error) {
+    console.error(`❌ [${correlationId}] Code lookup error:`, error);
+    return null;
+  }
+}
+
+function mapToUserProfile(user: any): UserProfile {
+  return {
+    userId: user.id,
+    name: user.full_name || "Friend",
+    userType: user.user_type || "general",
+    company: user.company_name,
+    role: user.role_title,
+    industry: user.industry,
+    familyContext: user.family_context,
+    additionalContext: user.additional_context,
+    accessCode: user.access_code,
+    totalQuestionsAsked: 0,
+  };
+}
+
+// ─── QUESTION PROGRESS (multi-session tracking) ───────────────────────────────
+
+/**
+ * Returns all question IDs this user has already been asked across all sessions.
+ * This is what lets us pick up exactly where we left off.
+ */
+export async function getUserQuestionProgress(
+  userId: string,
+  correlationId: string,
+): Promise<string[]> {
+  try {
+    const response = await fetch(
+      `${ENV.SUPABASE_URL}/rest/v1/user_question_progress?user_id=eq.${userId}&select=question_id&order=asked_at.asc`,
+      {
+        headers: {
+          apikey: ENV.SUPABASE_SERVICE_KEY,
+          Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
+        },
+      },
+    );
+
+    if (!response.ok) return [];
+    const rows = await response.json();
+    return rows.map((r: any) => r.question_id);
+  } catch (error) {
+    console.error(
+      `❌ [${correlationId}] Question progress fetch error:`,
+      error,
+    );
+    return [];
+  }
+}
+
+/**
+ * Saves a newly asked question to the user's permanent progress record.
+ */
+export async function saveQuestionProgress(
+  userId: string,
+  questionId: string,
+  sessionId: string,
+  correlationId: string,
+): Promise<void> {
+  try {
+    await fetch(`${ENV.SUPABASE_URL}/rest/v1/user_question_progress`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
+        apikey: ENV.SUPABASE_SERVICE_KEY,
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
+        user_id: userId,
+        question_id: questionId,
+        session_id: sessionId,
+        asked_at: new Date().toISOString(),
+      }),
+    });
+  } catch (error) {
+    console.error(`❌ [${correlationId}] Save question progress error:`, error);
+  }
+}
+
+async function getTotalQuestionsAsked(
+  userId: string,
+  correlationId: string,
+): Promise<number> {
+  const progress = await getUserQuestionProgress(userId, correlationId);
+  return progress.length;
+}
+
+// ─── SESSION MANAGEMENT ───────────────────────────────────────────────────────
+
+export async function createInboundSession(
+  sessionId: string,
+  userId: string,
+  callerPhone: string,
+  identifiedViaPhone: boolean,
+  sessionNumber: number,
+  correlationId: string,
+): Promise<string | null> {
+  try {
+    const response = await fetch(
+      `${ENV.SUPABASE_URL}/rest/v1/inbound_sessions`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
+          apikey: ENV.SUPABASE_SERVICE_KEY,
+          Prefer: "return=representation",
+        },
+        body: JSON.stringify({
+          session_id: sessionId,
+          user_id: userId,
+          caller_phone: callerPhone,
+          identified_via_phone: identifiedViaPhone,
+          session_number: sessionNumber,
+          status: "in_progress",
+          started_at: new Date().toISOString(),
+        }),
+      },
+    );
+
+    if (!response.ok) return null;
+    const rows = await response.json();
+    return rows[0]?.id || null;
+  } catch (error) {
+    console.error(`❌ [${correlationId}] Create session error:`, error);
+    return null;
+  }
+}
+
+export async function updateInboundSessionStatus(
+  sessionId: string,
+  status: "in_progress" | "completed" | "abandoned",
+  questionsAskedThisSession: number,
   correlationId: string,
 ): Promise<void> {
   try {
     const updates: any = {
-      call_status: status,
-      status:
-        status === "in_progress"
-          ? "in_progress"
-          : status === "completed"
-            ? "completed"
-            : "scheduled",
+      status,
+      questions_asked_this_session: questionsAskedThisSession,
     };
-
-    if (sessionId) updates.session_id = sessionId;
-    if (status === "in_progress")
-      updates.call_started_at = new Date().toISOString();
-    if (status === "completed")
-      updates.call_ended_at = new Date().toISOString();
+    if (status !== "in_progress") updates.ended_at = new Date().toISOString();
 
     await fetch(
-      `${ENV.SUPABASE_URL}/rest/v1/scheduled_calls?id=eq.${scheduledCallId}`,
+      `${ENV.SUPABASE_URL}/rest/v1/inbound_sessions?session_id=eq.${sessionId}`,
       {
         method: "PATCH",
         headers: {
@@ -148,17 +227,49 @@ export async function updateCallStatus(
         body: JSON.stringify(updates),
       },
     );
-
-    console.log(`✅ [${correlationId}] Updated status: ${status}`);
   } catch (error) {
-    console.error(`❌ [${correlationId}] Failed to update status:`, error);
+    console.error(`❌ [${correlationId}] Update session status error:`, error);
   }
 }
 
-export async function saveRecording(
-  scheduledCallId: string,
+// ─── CONVERSATION TURNS ───────────────────────────────────────────────────────
+
+export async function saveConversationTurn(
+  sessionId: string,
   userId: string,
-  lovedOneId: string,
+  turn: ConversationTurn,
+  correlationId: string,
+): Promise<void> {
+  try {
+    await fetch(`${ENV.SUPABASE_URL}/rest/v1/conversation_turns`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
+        apikey: ENV.SUPABASE_SERVICE_KEY,
+        Prefer: "return=minimal",
+      },
+      body: JSON.stringify({
+        session_id: sessionId,
+        user_id: userId,
+        role: turn.role,
+        content: turn.content,
+        question_id: turn.questionId || null,
+        is_follow_up: turn.isFollowUp || false,
+        audio_url: turn.audioUrl || null,
+        created_at: turn.timestamp,
+      }),
+    });
+  } catch (error) {
+    console.error(`❌ [${correlationId}] Save turn error:`, error);
+  }
+}
+
+// ─── RECORDINGS ───────────────────────────────────────────────────────────────
+
+export async function saveRecording(
+  sessionId: string,
+  userId: string,
   questionId: string,
   questionText: string,
   questionOrder: number,
@@ -178,9 +289,8 @@ export async function saveRecording(
         Prefer: "return=minimal",
       },
       body: JSON.stringify({
-        call_id: scheduledCallId,
+        session_id: sessionId,
         user_id: userId,
-        loved_one_id: lovedOneId,
         question_id: questionId,
         question_text: questionText,
         question_order: questionOrder,
@@ -190,18 +300,16 @@ export async function saveRecording(
         duration_seconds: duration,
         file_size_bytes: fileSize,
         transcription_status: "pending",
-        title: `Question ${questionOrder + 1}: ${questionText.substring(0, 50)}...`,
+        title: `Turn ${questionOrder + 1}: ${questionText.substring(0, 50)}`,
       }),
     });
-
-    console.log(`✅ [${correlationId}] Saved recording`);
   } catch (error) {
-    console.error(`❌ [${correlationId}] Failed to save recording:`, error);
+    console.error(`❌ [${correlationId}] Save recording error:`, error);
   }
 }
 
 export async function logEvent(
-  scheduledCallId: string,
+  sessionId: string,
   eventType: string,
   eventData: any,
   correlationId: string,
@@ -216,12 +324,12 @@ export async function logEvent(
         Prefer: "return=minimal",
       },
       body: JSON.stringify({
-        call_id: scheduledCallId,
+        session_id: sessionId,
         event_type: eventType,
         event_data: eventData,
       }),
     });
   } catch (error) {
-    console.error(`❌ [${correlationId}] Failed to log event:`, error);
+    console.error(`❌ [${correlationId}] Log event error:`, error);
   }
 }

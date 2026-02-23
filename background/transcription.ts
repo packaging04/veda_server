@@ -1,19 +1,17 @@
 /**
- * Background Transcription Handler
- * Uses OpenAI Whisper for speech-to-text
+ * Transcription — Both sync (for conversation loop) and async (for storage)
  */
 
 import { ENV } from "../config/env.ts";
 
-export async function transcribeRecording(
+/**
+ * Transcribes audio and returns the text — used synchronously in the conversation loop
+ */
+export async function transcribeAudio(
   audioBuffer: ArrayBuffer,
-  scheduledCallId: string,
-  questionId: string,
   correlationId: string,
-): Promise<void> {
+): Promise<string> {
   try {
-    console.log(`🎤 [${correlationId}] Transcribing...`);
-
     const formData = new FormData();
     formData.append(
       "file",
@@ -21,6 +19,7 @@ export async function transcribeRecording(
       "recording.mp3",
     );
     formData.append("model", "whisper-1");
+    formData.append("language", "en");
 
     const response = await fetch(
       "https://api.openai.com/v1/audio/transcriptions",
@@ -31,28 +30,49 @@ export async function transcribeRecording(
       },
     );
 
-    if (response.ok) {
-      const result = await response.json();
-      console.log(`✅ [${correlationId}] Transcribed`);
-
-      await fetch(
-        `${ENV.SUPABASE_URL}/rest/v1/recordings?call_id=eq.${scheduledCallId}&question_id=eq.${questionId}`,
-        {
-          method: "PATCH",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
-            apikey: ENV.SUPABASE_SERVICE_KEY,
-          },
-          body: JSON.stringify({
-            transcript: result.text,
-            full_transcript: result.text,
-            transcription_status: "completed",
-          }),
-        },
-      );
+    if (!response.ok) {
+      console.error(`❌ [${correlationId}] Whisper error: ${response.status}`);
+      return "";
     }
+
+    const result = await response.json();
+    return result.text?.trim() || "";
   } catch (error) {
     console.error(`❌ [${correlationId}] Transcription error:`, error);
+    return "";
+  }
+}
+
+/**
+ * Updates an existing recording record with its transcript
+ */
+export async function updateTranscriptInDB(
+  sessionId: string,
+  questionId: string,
+  transcript: string,
+  correlationId: string,
+): Promise<void> {
+  try {
+    const { ENV: env } = await import("../config/env.ts");
+    const { ENV: E } = await import("../config/env.ts");
+
+    await fetch(
+      `${ENV.SUPABASE_URL}/rest/v1/recordings?session_id=eq.${sessionId}&question_id=eq.${questionId}`,
+      {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
+          apikey: ENV.SUPABASE_SERVICE_KEY,
+        },
+        body: JSON.stringify({
+          transcript,
+          full_transcript: transcript,
+          transcription_status: "completed",
+        }),
+      },
+    );
+  } catch (error) {
+    console.error(`❌ [${correlationId}] Transcript DB update error:`, error);
   }
 }

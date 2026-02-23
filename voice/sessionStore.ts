@@ -1,45 +1,42 @@
 /**
- * Session Store
- * Manages active call sessions with cleanup
+ * Session Store — Inbound AI Conversation Sessions
  */
 
-import { CallSession } from "../types/voice.ts";
+import { InboundSession } from "../types/voice.ts";
 import { ENV } from "../config/env.ts";
-import { updateCallStatus } from "../db/supabase.ts";
+import { updateInboundSessionStatus } from "../db/supabase.ts";
 
-export const activeSessions = new Map<string, CallSession>();
+export const activeSessions = new Map<string, InboundSession>();
 export const processedCallbacks = new Set<string>();
 export const recordingProcessed = new Set<string>();
 
-// Session cleanup every 5 minutes
+// Cleanup every 5 minutes
 setInterval(
   () => {
     const now = Date.now();
+    const cleanupId = `cleanup-${Date.now()}`;
 
     for (const [sessionId, session] of activeSessions.entries()) {
       const age = now - new Date(session.lastActivity).getTime();
 
       if (age > ENV.SESSION_STALE_THRESHOLD_MS) {
         console.log(
-          `🧹 Cleaning stale session: ${sessionId} (${Math.round(age / 60000)} mins old)`,
+          `🧹 Stale session cleaned: ${sessionId} (${Math.round(age / 60000)} mins old)`,
         );
 
-        // Mark as abandoned in database
-        const status = session.currentQuestionIndex > 0 ? "failed" : "missed";
-        updateCallStatus(
-          session.scheduledCallId,
-          status,
+        // 4 args: sessionId, status, questionsAskedThisSession, correlationId
+        updateInboundSessionStatus(
           sessionId,
-          `cleanup-${Date.now()}`,
+          "abandoned",
+          session.sessionQuestionsAsked.length,
+          cleanupId,
         );
 
         activeSessions.delete(sessionId);
       }
     }
 
-    console.log(
-      `📊 Sessions: ${activeSessions.size}, Callbacks: ${processedCallbacks.size}, Recordings: ${recordingProcessed.size}`,
-    );
+    console.log(`📊 Active sessions: ${activeSessions.size}`);
   },
   5 * 60 * 1000,
 );

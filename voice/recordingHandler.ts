@@ -1,13 +1,18 @@
 /**
- * Recording Callback Handler
+ * Recording Handler
+ *
+ * Step 1 of the latency bridge:
+ * - Receives AT's recording callback
+ * - Saves the recording URL into the session store
+ * - Returns an instant "thinking" filler + Redirect to /ai_thinking
+ * - User hears a natural human pause while the heavy work happens
  */
 
 import { ENV } from "../config/env.ts";
 import { activeSessions, recordingProcessed } from "./sessionStore.ts";
-import { saveRecording, logEvent } from "../db/supabase.ts";
 import { buildVoiceXML } from "./voiceXml.ts";
 import { validateRecordingUrl } from "../security/helpers.ts";
-import { uploadToSupabase } from "../background/uploader.ts";
+import { AfricasTalkingAction } from "../types/voice.ts";
 
 export async function handleRecordingCallback(
   req: Request,
@@ -18,22 +23,27 @@ export async function handleRecordingCallback(
     const url = new URL(req.url);
 
     const recordingUrl = formData.get("recordingUrl") as string;
-    const durationInSeconds = formData.get("durationInSeconds") as string;
+    const durationInSeconds = parseInt(
+      (formData.get("durationInSeconds") as string) || "0",
+    );
     const sessionId = url.searchParams.get("sessionId");
-    const scheduledCallId = url.searchParams.get("scheduledCallId");
-    const questionIndex = url.searchParams.get("questionIndex");
-    const questionId = url.searchParams.get("questionId");
+    const phase = url.searchParams.get("phase") || "conversation";
+    const questionId = url.searchParams.get("questionId") || "";
+    const turnIndex = parseInt(url.searchParams.get("turnIndex") || "0");
 
-    if (!sessionId || !scheduledCallId || !questionIndex || !recordingUrl) {
-      return errorXml("Missing parameters");
+    console.log(
+      `📼 [${correlationId}] Recording received — session: ${sessionId}, turn: ${turnIndex}`,
+    );
+
+    if (!sessionId || !recordingUrl) {
+      return naturalErrorResponse();
     }
 
-    // IDEMPOTENCY CHECK
-    const recordingKey = `recording-${sessionId}-${questionIndex}`;
+    // Idempotency
+    const recordingKey = `rec-${sessionId}-${turnIndex}-${phase}`;
     if (recordingProcessed.has(recordingKey)) {
       console.log(`⚠️  [${correlationId}] Duplicate recording ignored`);
-      const redirectUrl = `${ENV.BASE_URL}/voice?sessionId=${sessionId}&scheduledCallId=${scheduledCallId}`;
-      return new Response(buildVoiceXML([{ redirect: { url: redirectUrl } }]), {
+      return new Response(buildVoiceXML([]), {
         status: 200,
         headers: { "Content-Type": "text/xml" },
       });
@@ -41,114 +51,67 @@ export async function handleRecordingCallback(
     recordingProcessed.add(recordingKey);
     setTimeout(() => recordingProcessed.delete(recordingKey), 10 * 60 * 1000);
 
-    // SSRF PROTECTION
+    // SSRF protection
     if (!validateRecordingUrl(recordingUrl)) {
-      console.error(
-        `❌ [${correlationId}] SSRF attempt blocked: ${recordingUrl}`,
-      );
-      return errorXml("Invalid recording source");
+      console.error(`❌ [${correlationId}] SSRF blocked: ${recordingUrl}`);
+      return naturalErrorResponse();
     }
-
-    console.log(
-      `📼 [${correlationId}] Recording received for Q${questionIndex}`,
-    );
 
     const session = activeSessions.get(sessionId);
     if (!session) {
-      console.error(`❌ [${correlationId}] Session not found`);
-      return errorXml("Session expired");
+      console.error(`❌ [${correlationId}] Session not found: ${sessionId}`);
+      return naturalErrorResponse();
     }
 
-    const qIndex = parseInt(questionIndex);
+    // ── SAVE recording URL into session for /ai_thinking to pick up ──────────
+    session.pendingRecordingUrl = recordingUrl;
+    session.pendingTurnIndex = turnIndex;
+    session.pendingQuestionId = questionId;
+    session.lastActivity = new Date().toISOString();
+    activeSessions.set(sessionId, session);
 
-    if (qIndex < 0 || qIndex >= session.questions.length) {
-      console.error(`❌ [${correlationId}] Invalid question index`);
-      return errorXml("Invalid question");
-    }
+    // ── Pick a filler phrase (rotated to feel natural) ────────────────────────
+    const fillerIndex = turnIndex % ENV.THINKING_FILLERS.length;
+    const filler = ENV.THINKING_FILLERS[fillerIndex];
 
-    const question = session.questions[qIndex];
+    // ── Respond INSTANTLY with filler + redirect ──────────────────────────────
+    // The user hears the filler while /ai_thinking does Whisper + Claude
+    const redirectUrl = `${ENV.BASE_URL}/ai_thinking?sessionId=${sessionId}&phase=${phase}&durationSeconds=${durationInSeconds}`;
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(
-      () => controller.abort(),
-      ENV.FETCH_TIMEOUT_MS,
-    );
+    const actions: AfricasTalkingAction[] = [
+      {
+        say: {
+          text: filler,
+          voice: "woman",
+          playBeep: false,
+        },
+      },
+      {
+        redirect: { url: redirectUrl },
+      },
+    ];
 
-    try {
-      const audioResponse = await fetch(recordingUrl, {
-        signal: controller.signal,
-      });
-      clearTimeout(timeoutId);
-
-      if (!audioResponse.ok) throw new Error(`Download failed`);
-
-      const audioBuffer = await audioResponse.arrayBuffer();
-      const fileSizeMB = audioBuffer.byteLength / (1024 * 1024);
-
-      if (fileSizeMB > ENV.MAX_RECORDING_SIZE_MB) {
-        throw new Error(`Recording too large: ${fileSizeMB.toFixed(2)}MB`);
-      }
-
-      console.log(
-        `✅ [${correlationId}] Downloaded ${fileSizeMB.toFixed(2)} MB`,
-      );
-
-      const fileName = `${scheduledCallId}/q${qIndex}-${Date.now()}.mp3`;
-      const storagePath = `${session.userId}/${fileName}`;
-
-      // Upload async (non-blocking)
-      uploadToSupabase(
-        audioBuffer,
-        storagePath,
-        scheduledCallId,
-        session.userId,
-        session.lovedOneId,
-        questionId || question.id,
-        question.text,
-        qIndex,
-        parseInt(durationInSeconds || "0"),
-        correlationId,
-      ).catch((err) => {
-        console.error(`❌ [${correlationId}] Background upload failed:`, err);
-      });
-
-      // ATOMIC: Increment only after successful download NOTHING
-      session.currentQuestionIndex = qIndex + 1;
-      session.lastActivity = new Date().toISOString();
-      activeSessions.set(sessionId, session);
-
-      console.log(
-        `✅ [${correlationId}] Advanced to Q${session.currentQuestionIndex + 1}`,
-      );
-    } finally {
-      clearTimeout(timeoutId);
-    }
-
-    const redirectUrl = `${ENV.BASE_URL}/voice?sessionId=${sessionId}&scheduledCallId=${scheduledCallId}`;
-
-    return new Response(buildVoiceXML([{ redirect: { url: redirectUrl } }]), {
+    return new Response(buildVoiceXML(actions), {
       status: 200,
       headers: { "Content-Type": "text/xml" },
     });
   } catch (error) {
-    console.error(`❌ [${correlationId}] Recording error:`, error);
-    return errorXml("Recording failed");
+    console.error(`❌ [${correlationId}] Recording handler error:`, error);
+    return naturalErrorResponse();
   }
 }
 
-function errorXml(message: string): Response {
+function naturalErrorResponse(): Response {
   return new Response(
     buildVoiceXML([
       {
         say: {
-          text: `An error occurred: ${message}. Continuing.`,
+          text: "I'm sorry, I had a brief moment there. Could you say that again?",
           voice: "woman",
+          playBeep: false,
         },
       },
     ]),
-    {
-      status: 200,
-      headers: { "Content-Type": "text/xml" },
-    },
+    { status: 200, headers: { "Content-Type": "text/xml" } },
   );
 }

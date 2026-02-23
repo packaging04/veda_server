@@ -1,62 +1,54 @@
-/**
- * Voice Callback Handler - Enhanced with debugging
- */
-
 import { ENV } from "../config/env.ts";
 import { activeSessions, processedCallbacks } from "./sessionStore.ts";
 import {
-  fetchCallDetails,
-  updateCallStatus,
+  lookupUserByPhone,
+  createInboundSession,
+  updateInboundSessionStatus,
   logEvent,
+  getUserQuestionProgress,
 } from "../db/supabase.ts";
 import { buildVoiceXML } from "./voiceXml.ts";
-import { sanitizePhoneNumber, hashPii } from "../security/helpers.ts";
-import { AfricasTalkingAction } from "../types/voice.ts";
+import { sanitizePhoneNumber } from "../security/helpers.ts";
+import { getGreeting, getFirstQuestion } from "./aiConversation.ts";
+import { saveConversationTurn, saveQuestionProgress } from "../db/supabase.ts";
+import { AfricasTalkingAction, InboundSession } from "../types/voice.ts";
 
 export async function handleVoiceCallback(
   req: Request,
   correlationId: string,
 ): Promise<Response> {
   try {
-    console.log("📞 CALLBACK HIT", new Date().toISOString());
-
     const formData = await req.formData();
     const url = new URL(req.url);
 
-    // Log all incoming data for debugging
-    console.log(`🔍 [${correlationId}] URL:`, url.toString());
-    console.log(
-      `🔍 [${correlationId}] Query params:`,
-      Object.fromEntries(url.searchParams),
-    );
-    console.log(
-      `🔍 [${correlationId}] Form data:`,
-      Object.fromEntries(formData),
-    );
+    console.log(`📞 [${correlationId}] Inbound call`);
 
     const sessionId = formData.get("sessionId") as string;
     const isActive = formData.get("isActive") as string;
+    const callerNumber = sanitizePhoneNumber(
+      (formData.get("callerNumber") as string) || "",
+    );
 
-    if (!sessionId) {
-      console.error(`❌ [${correlationId}] Missing sessionId in form data`);
-      return errorResponse("Missing session");
-    }
+    if (!sessionId) return errorResponse("Session error");
 
-    // Handle call end
+    // ── Call ended ────────────────────────────────────────────────────────────
     if (isActive === "0") {
-      console.log(`📴 [${correlationId}] Call ended: ${sessionId}`);
       const session = activeSessions.get(sessionId);
       if (session) {
-        await updateCallStatus(
-          session.scheduledCallId,
-          "completed",
+        await updateInboundSessionStatus(
           sessionId,
+          "completed",
+          session.sessionQuestionsAsked.length,
           correlationId,
         );
         await logEvent(
-          session.scheduledCallId,
+          sessionId,
           "call_ended",
-          {},
+          {
+            turns: session.conversationHistory.length,
+            session_questions: session.sessionQuestionsAsked.length,
+            global_questions: session.globalQuestionsAsked.length,
+          },
           correlationId,
         );
         activeSessions.delete(sessionId);
@@ -64,23 +56,9 @@ export async function handleVoiceCallback(
       return new Response("", { status: 200 });
     }
 
-    const scheduledCallId = url.searchParams.get("scheduledCallId");
-
-    if (!scheduledCallId) {
-      console.error(`❌ [${correlationId}] Missing scheduledCallId in URL`);
-      console.error(
-        `❌ [${correlationId}] This means the call was not initiated with the scheduledCallId parameter`,
-      );
-      console.error(
-        `❌ [${correlationId}] Check your makeCall function in processor.ts`,
-      );
-      return errorResponse("Invalid call - missing identifier");
-    }
-
-    // IDEMPOTENCY CHECK
-    const idempotencyKey = `voice-${sessionId}-${isActive}-${scheduledCallId}`;
+    // ── Idempotency ───────────────────────────────────────────────────────────
+    const idempotencyKey = `voice-${sessionId}-${isActive}`;
     if (processedCallbacks.has(idempotencyKey)) {
-      console.log(`⚠️  [${correlationId}] Duplicate callback ignored`);
       return new Response(buildVoiceXML([]), {
         status: 200,
         headers: { "Content-Type": "text/xml" },
@@ -91,182 +69,241 @@ export async function handleVoiceCallback(
 
     let session = activeSessions.get(sessionId);
 
+    // ── New session ───────────────────────────────────────────────────────────
     if (!session) {
-      console.log(`✨ [${correlationId}] New session - fetching call details`);
+      const profileByPhone = callerNumber
+        ? await lookupUserByPhone(callerNumber, correlationId)
+        : null;
 
-      const callDetails = await fetchCallDetails(
-        scheduledCallId,
-        correlationId,
-      );
-
-      if (!callDetails) {
-        console.error(
-          `❌ [${correlationId}] Call not found in database: ${scheduledCallId}`,
-        );
-        return errorResponse("Call not found");
-      }
-
-      console.log(
-        `✅ [${correlationId}] Call details found for ${hashPii(callDetails.lovedOneName)}`,
-      );
+      // Load global question history if we identified the user
+      const globalQuestionsAsked = profileByPhone
+        ? await getUserQuestionProgress(profileByPhone.userId, correlationId)
+        : [];
 
       session = {
         sessionId,
-        scheduledCallId,
-        userId: callDetails.userId,
-        lovedOneId: callDetails.lovedOneId,
-        lovedOneName: callDetails.lovedOneName,
-        phoneNumber: sanitizePhoneNumber(callDetails.phoneNumber),
-        currentQuestionIndex: 0,
-        questions: callDetails.questions,
+        userId: profileByPhone?.userId || "",
+        userProfile: profileByPhone,
+        callerPhone: callerNumber,
+        phase: profileByPhone ? "greeting" : "identifying",
+        conversationHistory: [],
+        sessionQuestionsAsked: [],
+        globalQuestionsAsked,
+        currentQuestionId: null,
+        followUpCount: 0,
+        pendingRecordingUrl: null,
+        pendingTurnIndex: 0,
+        pendingQuestionId: "",
         startedAt: new Date().toISOString(),
         lastActivity: new Date().toISOString(),
+        identifiedViaPhone: !!profileByPhone,
       };
 
       activeSessions.set(sessionId, session);
 
-      await updateCallStatus(
-        scheduledCallId,
-        "in_progress",
-        sessionId,
-        correlationId,
-      );
-      await logEvent(
-        scheduledCallId,
-        "call_started",
-        {
-          loved_one_name: callDetails.lovedOneName,
-          total_questions: session.questions.length,
-        },
-        correlationId,
-      );
+      if (profileByPhone) {
+        // Get session count for this user
+        const sessionNumber = await getUserSessionCount(
+          profileByPhone.userId,
+          correlationId,
+        );
 
-      console.log(
-        `📞 [${correlationId}] Session created for ${hashPii(callDetails.lovedOneName)} with ${session.questions.length} questions`,
-      );
+        await createInboundSession(
+          sessionId,
+          profileByPhone.userId,
+          callerNumber,
+          true,
+          sessionNumber,
+          correlationId,
+        );
+        await logEvent(
+          sessionId,
+          "call_started_identified",
+          {
+            method: "phone_window",
+            user_type: profileByPhone.userType,
+            past_questions: globalQuestionsAsked.length,
+            session_number: sessionNumber,
+          },
+          correlationId,
+        );
+      } else {
+        await logEvent(
+          sessionId,
+          "call_started_unknown",
+          {
+            caller_phone: callerNumber,
+          },
+          correlationId,
+        );
+      }
     } else {
       session.lastActivity = new Date().toISOString();
-      console.log(`🔄 [${correlationId}] Existing session updated`);
+      activeSessions.set(sessionId, session);
     }
 
-    const actions: AfricasTalkingAction[] = [];
-
-    // Greeting
-    if (session.currentQuestionIndex === 0) {
-      console.log(`👋 [${correlationId}] Sending greeting`);
-
-      actions.push({
-        say: {
-          text: `Hello ${session.lovedOneName}. This is Veda, calling to help preserve your precious memories for your family. This call will be recorded. Are you ready to share your stories?`,
-          voice: "woman",
-          playBeep: false,
-        },
-      });
-
-      actions.push({ pause: { length: 2 } });
-
-      actions.push({
-        say: {
-          text: "Let's begin.",
-          voice: "woman",
-          playBeep: false,
-        },
-      });
-
-      actions.push({ pause: { length: 1 } });
+    // ── Route to correct phase ────────────────────────────────────────────────
+    if (session.phase === "identifying") {
+      return handleIdentificationPhase(session, sessionId);
     }
 
-    // Ask current question
-    if (session.currentQuestionIndex < session.questions.length) {
-      const currentQ = session.questions[session.currentQuestionIndex];
-
-      console.log(
-        `❓ [${correlationId}] Asking Q${session.currentQuestionIndex + 1}/${session.questions.length}: ${currentQ.text.substring(0, 50)}...`,
-      );
-
-      actions.push({
-        say: {
-          text: currentQ.text,
-          voice: "woman",
-          playBeep: false,
-        },
-      });
-
-      actions.push({ pause: { length: 1 } });
-
-      const callbackUrl = `${ENV.BASE_URL}/recording?sessionId=${sessionId}&scheduledCallId=${scheduledCallId}&questionIndex=${session.currentQuestionIndex}&questionId=${currentQ.id}`;
-
-      actions.push({
-        record: {
-          maxLength: 180,
-          timeout: 5,
-          finishOnKey: "#",
-          trimSilence: true,
-          playBeep: true,
-          callbackUrl,
-        },
-      });
-
-      await logEvent(
-        scheduledCallId,
-        "question_asked",
-        {
-          question_index: session.currentQuestionIndex,
-          question_id: currentQ.id,
-        },
-        correlationId,
-      );
-    } else {
-      console.log(`✅ [${correlationId}] All questions completed`);
-
-      actions.push({
-        say: {
-          text: `Thank you so much for sharing these beautiful memories, ${session.lovedOneName}. Your stories will be treasured for generations. Goodbye.`,
-          voice: "woman",
-          playBeep: false,
-        },
-      });
-
-      await updateCallStatus(
-        session.scheduledCallId,
-        "completed",
-        sessionId,
-        correlationId,
-      );
-
-      setTimeout(() => activeSessions.delete(sessionId), 10000);
+    if (session.phase === "greeting") {
+      return await handleGreetingPhase(session, sessionId, correlationId);
     }
 
-    const xmlResponse = buildVoiceXML(actions);
-    console.log(
-      `📤 [${correlationId}] Sending XML response (${xmlResponse.length} chars)`,
-    );
-
-    return new Response(xmlResponse, {
+    return new Response(buildVoiceXML([]), {
       status: 200,
       headers: { "Content-Type": "text/xml" },
     });
   } catch (error) {
-    console.error(`❌ [${correlationId}] Voice error:`, error);
-    // console.error(`❌ [${correlationId}] Stack:`, error.stack);
-    return errorResponse("Technical difficulty");
+    console.error(`❌ [${correlationId}] Voice handler error:`, error);
+    return errorResponse("technical difficulty");
+  }
+}
+
+function handleIdentificationPhase(
+  session: InboundSession,
+  sessionId: string,
+): Response {
+  const isReturning = false; // could detect based on known phone
+
+  const actions: AfricasTalkingAction[] = [
+    {
+      say: {
+        text: "Hello, and welcome to Veda. I'm so glad you called. To get started, could you please say your personal access code? You would have received it when you registered. Please say it clearly after the beep.",
+        voice: "woman",
+        playBeep: false,
+      },
+    },
+    { pause: { length: 1 } },
+    {
+      record: {
+        maxLength: 15,
+        timeout: 8,
+        finishOnKey: "#",
+        trimSilence: true,
+        playBeep: true,
+        callbackUrl: `${ENV.BASE_URL}/recording?sessionId=${sessionId}&phase=identification`,
+      },
+    },
+  ];
+
+  return new Response(buildVoiceXML(actions), {
+    status: 200,
+    headers: { "Content-Type": "text/xml" },
+  });
+}
+
+async function handleGreetingPhase(
+  session: InboundSession,
+  sessionId: string,
+  correlationId: string,
+): Promise<Response> {
+  const greetingText = await getGreeting(session);
+  const firstQ = await getFirstQuestion(session);
+
+  session.conversationHistory.push({
+    role: "veda",
+    content: greetingText,
+    timestamp: new Date().toISOString(),
+  });
+  session.conversationHistory.push({
+    role: "veda",
+    content: firstQ.speech,
+    timestamp: new Date().toISOString(),
+    questionId: firstQ.questionId,
+  });
+  session.sessionQuestionsAsked.push(firstQ.questionId);
+  session.globalQuestionsAsked.push(firstQ.questionId);
+  session.currentQuestionId = firstQ.questionId;
+  session.phase = "conversation";
+  activeSessions.set(sessionId, session);
+
+  if (session.userId) {
+    await saveQuestionProgress(
+      session.userId,
+      firstQ.questionId,
+      sessionId,
+      correlationId,
+    );
+  }
+
+  await saveConversationTurn(
+    sessionId,
+    session.userId,
+    {
+      role: "veda",
+      content: greetingText,
+      timestamp: new Date().toISOString(),
+    },
+    correlationId,
+  );
+  await saveConversationTurn(
+    sessionId,
+    session.userId,
+    {
+      role: "veda",
+      content: firstQ.speech,
+      timestamp: new Date().toISOString(),
+      questionId: firstQ.questionId,
+      isFollowUp: false,
+    },
+    correlationId,
+  );
+
+  return new Response(
+    buildVoiceXML([
+      { say: { text: greetingText, voice: "woman", playBeep: false } },
+      { pause: { length: 1 } },
+      { say: { text: firstQ.speech, voice: "woman", playBeep: false } },
+      { pause: { length: 1 } },
+      {
+        record: {
+          maxLength: ENV.RECORDING_MAX_LENGTH_SECONDS,
+          timeout: ENV.RECORDING_TIMEOUT_SECONDS,
+          finishOnKey: "#",
+          trimSilence: true,
+          playBeep: false,
+          callbackUrl: `${ENV.BASE_URL}/recording?sessionId=${sessionId}&phase=conversation&questionId=${firstQ.questionId}&turnIndex=0`,
+        },
+      },
+    ]),
+    { status: 200, headers: { "Content-Type": "text/xml" } },
+  );
+}
+
+async function getUserSessionCount(
+  userId: string,
+  correlationId: string,
+): Promise<number> {
+  try {
+    const response = await fetch(
+      `${ENV.SUPABASE_URL}/rest/v1/inbound_sessions?user_id=eq.${userId}&select=id`,
+      {
+        headers: {
+          apikey: ENV.SUPABASE_SERVICE_KEY,
+          Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
+        },
+      },
+    );
+    if (!response.ok) return 1;
+    const rows = await response.json();
+    return rows.length + 1;
+  } catch {
+    return 1;
   }
 }
 
 function errorResponse(message: string): Response {
-  console.log(`⚠️  Sending error response: ${message}`);
   return new Response(
     buildVoiceXML([
       {
         say: {
-          text: `I apologize, but we're experiencing ${message}. Please try again later. Goodbye.`,
+          text: "I'm sorry, we're experiencing a technical issue. Please try calling back shortly. Goodbye.",
           voice: "woman",
         },
       },
     ]),
-    {
-      status: 200,
-      headers: { "Content-Type": "text/xml" },
-    },
+    { status: 200, headers: { "Content-Type": "text/xml" } },
   );
 }

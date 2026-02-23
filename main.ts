@@ -1,35 +1,20 @@
-/**
- * VEDA Unified Server - Single Entry Point
- * Handles both voice callbacks AND automated scheduling
- */
 import { ENV } from "./config/env.ts";
-import "./scheduler/cron.ts";
 import { handleVoiceCallback } from "./voice/voiceHandler.ts";
 import { handleRecordingCallback } from "./voice/recordingHandler.ts";
-import { processScheduledCalls } from "./scheduler/processor.ts";
+import { handleAIThinking } from "./voice/aiThinkingHandler.ts";
 import { activeSessions } from "./voice/sessionStore.ts";
 
 Deno.serve(async (req: Request) => {
   const url = new URL(req.url);
   const correlationId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
-
   console.log(`📨 [${correlationId}] ${req.method} ${url.pathname}`);
-  //https://api.africastalking.com/test/voice
-  // ============================================================================
-  // HEALTH & INFO ENDPOINTS
-  // ============================================================================
 
   if (req.method === "GET" && url.pathname === "/") {
     return Response.json({
       status: "running",
-      service: "Veda Voice & Scheduler Server",
-      version: "1.0.0",
-      timestamp: new Date().toISOString(),
-      features: [
-        "voice_callbacks",
-        "recording_processing",
-        "automated_scheduling",
-      ],
+      service: "Veda Inbound AI Voice Server",
+      version: "2.0.0",
+      active_sessions: activeSessions.size,
     });
   }
 
@@ -41,198 +26,34 @@ Deno.serve(async (req: Request) => {
     });
   }
 
-  if (req.method === "GET" && url.pathname === "/config") {
-    return Response.json({
-      environment: {
-        callback_url: ENV.CALLBACK_URL,
-        base_url: ENV.BASE_URL,
-        at_caller_id: ENV.AT_CALLER_ID,
-        at_username: ENV.AT_USERNAME,
-        at_api_key: ENV.AT_API_KEY
-          ? "***" + ENV.AT_API_KEY.slice(-4)
-          : "NOT SET",
-        max_concurrent_calls: ENV.MAX_CONCURRENT_CALLS,
-      },
-      note: "Check if CALLBACK_URL matches your deployment URL",
-    });
-  }
-
-  // ============================================================================
-  // VOICE ENDPOINTS
-  // ============================================================================
-
-  // Test endpoint - GET /voice (for browser/manual testing)
   if (req.method === "GET" && url.pathname === "/voice") {
     return new Response(
-      `<?xml version="1.0" encoding="UTF-8"?>
-      <Response>
-        <Say voice="woman">Veda voice test successful. Hello. This is Veda calling. Your voice system is now working.</Say>
-        <Dial phoneNumbers="+2348165758478" />
-      </Response>`,
-      {
-        status: 200,
-        headers: {
-          "Content-Type": "text/xml",
-          "X-Test-Mode": "true",
-        },
-      },
+      `<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="woman">Hello. This is Veda. Your voice system is working correctly.</Say></Response>`,
+      { status: 200, headers: { "Content-Type": "text/xml" } },
     );
   }
 
-  // Production endpoint - POST /voice (from Africa's Talking)
+  // ── Core voice flow ──────────────────────────────────────────────────────────
   if (req.method === "POST" && url.pathname === "/voice") {
     return handleVoiceCallback(req, correlationId);
   }
 
+  // Step 1: Receive recording, return instant filler + redirect
   if (req.method === "POST" && url.pathname === "/recording") {
     return handleRecordingCallback(req, correlationId);
   }
 
-  // ============================================================================
-  // MANUAL TRIGGER (Testing)
-  // ============================================================================
-
-  if (req.method === "POST" && url.pathname === "/trigger") {
-    console.log("🔧 Manual trigger");
-
-    const result = await processScheduledCalls();
-
-    return Response.json({
-      success: true,
-      timestamp: new Date().toISOString(),
-      stats: result,
-    });
+  // Step 2: Do heavy AI work, return real response
+  // AT sends this as GET (following the <Redirect>)
+  if (req.method === "GET" && url.pathname === "/ai_thinking") {
+    return handleAIThinking(req, correlationId);
   }
 
-  // ============================================================================
-  // 404 - NOT FOUND
-  // ============================================================================
-
   return new Response(
-    JSON.stringify({
-      error: "Not Found",
-      path: url.pathname,
-      method: req.method,
-      availableEndpoints: [
-        "GET /",
-        "GET /health",
-        "GET /voice (test)",
-        "POST /voice (production)",
-        "POST /recording",
-        "POST /trigger",
-      ],
-    }),
-    {
-      status: 404,
-      headers: { "Content-Type": "application/json" },
-    },
+    JSON.stringify({ error: "Not Found", path: url.pathname }),
+    { status: 404, headers: { "Content-Type": "application/json" } },
   );
 });
 
-// ============================================================================
-// STARTUP LOG
-// ============================================================================
-
-console.log("🚀 Veda Unified Server Started");
-console.log("📊 Services:");
-console.log("   ✅ Voice callback handler (GET test + POST production)");
-console.log("   ✅ Recording processor");
-console.log("   ✅ Automated scheduler");
-console.log("🔒 Security features enabled");
-console.log("✅ Ready for requests");
-console.log("");
-console.log("📍 Available endpoints:");
-console.log("   GET  / - Service info");
-console.log("   GET  /health - Health check");
-console.log("   GET  /voice - Test XML response");
-console.log("   POST /voice - Production callback");
-console.log("   POST /recording - Recording callback");
-console.log("   POST /trigger - Manual scheduler trigger");
-
-// /**
-//  * VEDA Unified Server - Single Entry Point
-//  * Handles both voice callbacks AND automated scheduling
-//  */
-// import "./scheduler/cron.ts";
-// import { handleVoiceCallback } from "./voice/voiceHandler.ts";
-// import { handleRecordingCallback } from "./voice/recordingHandler.ts";
-// import { processScheduledCalls } from "./scheduler/processor.ts";
-// import { activeSessions } from "./voice/sessionStore.ts";
-
-// Deno.serve(async (req: Request) => {
-//   const url = new URL(req.url);
-//   const correlationId = `req-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
-
-//   console.log(`📨 [${correlationId}] ${req.method} ${url.pathname}`);
-
-//   // ============================================================================
-//   // HEALTH & INFO ENDPOINTS
-//   // ============================================================================
-
-//   if (req.method === "GET" && url.pathname === "/") {
-//     return Response.json({
-//       status: "running",
-//       service: "Veda Voice & Scheduler Server",
-//       version: "1.0.0",
-//       timestamp: new Date().toISOString(),
-//       features: [
-//         "voice_callbacks",
-//         "recording_processing",
-//         "automated_scheduling",
-//       ],
-//     });
-//   }
-
-//   if (req.method === "GET" && url.pathname === "/health") {
-//     return Response.json({
-//       status: "healthy",
-//       sessions: activeSessions.size,
-//       timestamp: new Date().toISOString(),
-//     });
-//   }
-
-//   // ============================================================================
-//   // VOICE CALLBACKS (from Africa's Talking)
-//   // ============================================================================
-
-//   if (req.method === "POST" && url.pathname === "/voice") {
-//     return handleVoiceCallback(req, correlationId);
-//   }
-
-//   if (req.method === "POST" && url.pathname === "/recording") {
-//     return handleRecordingCallback(req, correlationId);
-//   }
-
-//   //https://api.africastalking.com/test/voice
-
-//   // Manual trigger - for testing
-//   if (req.method === "POST" && url.pathname === "/trigger") {
-//     console.log("🔧 Manual trigger");
-
-//     const result = await processScheduledCalls();
-
-//     return Response.json({
-//       success: true,
-//       timestamp: new Date().toISOString(),
-//       stats: result,
-//     });
-//   }
-
-//   // ============================================================================
-//   // 404 - NOT FOUND
-//   // ============================================================================
-
-//   return new Response("Not Found", { status: 404 });
-// });
-
-// // ============================================================================
-// // STARTUP LOG
-// // ============================================================================
-
-// console.log("🚀 Veda Unified Server Started");
-// console.log("📊 Services:");
-// console.log("   ✅ Voice callback handler");
-// console.log("   ✅ Recording processor");
-// console.log("   ✅ Automated scheduler");
-// console.log("🔒 Security features enabled");
-// console.log("✅ Ready for requests");
+console.log("🚀 Veda Inbound AI Voice Server v2.0");
+console.log("📞 Endpoints: POST /voice | POST /recording | GET /ai_thinking");

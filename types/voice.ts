@@ -1,24 +1,76 @@
-/**
- * Type Definitions
- */
-
 export interface Question {
   id: string;
   text: string;
   order: number;
+  category?: string;
 }
 
-export interface CallSession {
-  sessionId: string;
-  scheduledCallId: string;
+export interface UserProfile {
   userId: string;
-  lovedOneId: string;
-  lovedOneName: string;
-  phoneNumber: string;
-  currentQuestionIndex: number;
-  questions: Question[];
+  name: string;
+  userType:
+    | "ceo_founder"
+    | "alzheimer_patient"
+    | "patriarch_matriarch"
+    | "general";
+  company?: string;
+  role?: string;
+  industry?: string;
+  familyContext?: string;
+  additionalContext?: string;
+  accessCode: string;
+  totalQuestionsAsked: number; // lifetime total across all sessions
+}
+
+export interface ConversationTurn {
+  role: "veda" | "user";
+  content: string;
+  timestamp: string;
+  questionId?: string;
+  isFollowUp?: boolean;
+  audioUrl?: string;
+}
+
+export interface InboundSession {
+  sessionId: string;
+  userId: string;
+  userProfile: UserProfile | null;
+  callerPhone: string;
+
+  // Conversation state
+  phase:
+    | "identifying"
+    | "identification_retry"
+    | "greeting"
+    | "conversation"
+    | "completing"
+    | "complete";
+  conversationHistory: ConversationTurn[];
+
+
+  // Question tracking — two levels
+  sessionQuestionsAsked: string[]; // question IDs asked THIS session only
+  globalQuestionsAsked: string[]; // question IDs asked across ALL sessions (loaded from DB)
+  currentQuestionId: string | null;
+  followUpCount: number;
+
+  // Latency bridge — stores recording URL between /recording and /ai_thinking
+  pendingRecordingUrl: string | null;
+  pendingTurnIndex: number;
+  pendingQuestionId: string;
+
+  // Metadata
   startedAt: string;
   lastActivity: string;
+  identifiedViaPhone: boolean;
+  inboundSessionDbId?: string;
+}
+
+export interface AIDecision {
+  speech: string;
+  action: "ask_question" | "follow_up" | "end_session";
+  questionId?: string;
+  reasoning?: string;
 }
 
 export interface AfricasTalkingAction {
@@ -41,19 +93,6 @@ export interface AfricasTalkingAction {
   redirect?: {
     url: string;
   };
-}
-
-export interface DueCall {
-  scheduled_call_id: string;
-  call_id: string;
-  user_id: string;
-  loved_one_id: string;
-  loved_one_name: string;
-  loved_one_phone: string;
-  scheduled_for: string;
-  duration_minutes: number;
-  interview_session_id: string;
-  questions: any[];
 }
 
 export interface SchedulerResult {
