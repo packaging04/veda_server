@@ -88,7 +88,7 @@ function mapToUserProfile(user: any): UserProfile {
   };
 }
 
-// ─── QUESTION PROGRESS (multi-session tracking) ───────────────────────────────
+// ─── QUESTION PROGRESS (multi-session tracking) ───────────
 
 /**
  * Returns all question IDs this user has already been asked across all sessions.
