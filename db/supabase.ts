@@ -1,41 +1,94 @@
 /**
  * Supabase DB Layer — aligned with actual Veda schema
  *
- * Actual tables:
- *   profiles          — user accounts (id, first_name, last_name, phone, user_type,
- *                       occupation, legacy_goal, profile_completed, calls_remaining,
- *                       subscription_plan, other_name, other_relationship)
- *   inbound_schedules — scheduled call windows (call_code, scheduled_date,
- *                       start_time, end_time, user_id, status)
- *   call_recordings   — per-session recording log (minimal)
- *
- * New tables created by the migration below:
- *   inbound_sessions       — one row per call session
- *   user_question_progress — which questions each user has been asked (multi-session)
- *   conversation_turns     — full transcript of every session
+ * Tables used:
+ *   profiles              — user accounts
+ *   inbound_schedules     — scheduled call windows (call_code, scheduled_date, start_time, end_time)
+ *   inbound_sessions      — one row per call session
+ *   user_question_progress— multi-session question tracking
+ *   conversation_turns    — full transcript
+ *   call_recordings       — recording metadata
+ *   call_logs             — event log
  */
 
 import { ENV } from "../config/env.ts";
 import { UserProfile, ConversationTurn } from "../types/voice.ts";
 
+// ─── PHONE NORMALISATION ──────────────────────────────────────────────────────
+
+/**
+ * Extract the last N significant digits from any phone format.
+ * Works across +234XXXXXXXXXX, 0XXXXXXXXX, 234XXXXXXXXX, etc.
+ */
+function lastDigits(phone: string, n = 10): string {
+  return phone.replace(/\D/g, "").slice(-n);
+}
+
+function phonesMatch(a: string, b: string): boolean {
+  if (!a || !b) return false;
+  return lastDigits(a) === lastDigits(b);
+}
+
 // ─── USER IDENTIFICATION ──────────────────────────────────────────────────────
 
 /**
  * Look up a user by their phone number during an active call window.
- * Checks: profiles.phone matches AND there's a current inbound_schedule window.
+ * Identifies the caller if: their registered phone matches AND there's
+ * a 'scheduled' inbound_schedule window containing the current time today.
  */
+/**
+ * Fetch a single profile row by user id (step 2 of two-step lookups).
+ * PostgREST cannot join inbound_schedules → profiles directly because
+ * there is no FK between them (both reference auth.users.id separately).
+ */
+async function fetchProfileById(
+  userId: string,
+  correlationId: string,
+): Promise<any | null> {
+  try {
+    const resp = await fetch(
+      `${ENV.SUPABASE_URL}/rest/v1/profiles` +
+        `?id=eq.${userId}` +
+        `&select=id,first_name,last_name,phone,user_type,occupation,legacy_goal,other_name,other_relationship` +
+        `&limit=1`,
+      {
+        headers: {
+          apikey: ENV.SUPABASE_SERVICE_KEY,
+          Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
+        },
+      },
+    );
+    if (!resp.ok) return null;
+    const rows = await resp.json();
+    return rows[0] || null;
+  } catch (err) {
+    console.error(`❌ [${correlationId}] fetchProfileById error:`, err);
+    return null;
+  }
+}
+
 export async function lookupUserByPhone(
   phoneNumber: string,
   correlationId: string,
 ): Promise<UserProfile | null> {
   try {
-    const now = new Date();
+    // Deno Deploy runs UTC — Nigeria is UTC+1
+    const now = new Date(Date.now() + 60 * 60 * 1000);
     const todayDate = now.toISOString().split("T")[0]; // YYYY-MM-DD
-    const currentTime = now.toTimeString().slice(0, 5); // HH:MM
+    const currentTime = now.toISOString().split("T")[1].slice(0, 5); // HH:MM
 
-    // Find a profile with this phone that has an active schedule window today
-    const response = await fetch(
-      `${ENV.SUPABASE_URL}/rest/v1/inbound_schedules?scheduled_date=eq.${todayDate}&start_time=lte.${currentTime}&end_time=gte.${currentTime}&status=eq.scheduled&select=call_code,user_id,profiles(id,first_name,last_name,phone,user_type,occupation,legacy_goal,other_name,other_relationship)`,
+    console.log(
+      `🔍 [${correlationId}] Phone lookup — Nigeria time: ${todayDate} ${currentTime}, caller: ${phoneNumber}`,
+    );
+
+    // Step 1: find all scheduled windows active right now
+    const resp = await fetch(
+      `${ENV.SUPABASE_URL}/rest/v1/inbound_schedules` +
+        `?scheduled_date=eq.${todayDate}` +
+        `&start_time=lte.${currentTime}` +
+        `&end_time=gte.${currentTime}` +
+        `&status=eq.scheduled` +
+        `&select=call_code,user_id`,
       {
         headers: {
           apikey: ENV.SUPABASE_SERVICE_KEY,
@@ -44,33 +97,39 @@ export async function lookupUserByPhone(
       },
     );
 
-    if (!response.ok) return null;
-    const windows = await response.json();
-
-    // Find a window whose user's phone matches the caller
-    const cleanCaller = phoneNumber.replace(/\s+/g, "");
-    const match = windows.find((w: any) => {
-      const profilePhone = w.profiles?.phone?.replace(/\s+/g, "");
-      return (
-        profilePhone &&
-        cleanCaller.endsWith(
-          profilePhone.replace(/^\+234/, "0").replace(/^\+/, ""),
-        )
+    if (!resp.ok) {
+      console.error(
+        `❌ [${correlationId}] Schedule fetch HTTP ${resp.status}: ${await resp.text()}`,
       );
-    });
+      return null;
+    }
 
-    if (!match || !match.profiles) return null;
+    const windows: { call_code: string; user_id: string }[] = await resp.json();
+    console.log(`🔍 [${correlationId}] Active windows: ${windows.length}`);
+    if (!windows.length) return null;
 
-    const profile = mapProfileToUserProfile(match.profiles, match.call_code);
-    profile.totalQuestionsAsked = await getTotalQuestionsAsked(
-      profile.userId,
-      correlationId,
-    );
+    // Step 2: for each window, fetch the profile and check the phone
+    for (const win of windows) {
+      const profile = await fetchProfileById(win.user_id, correlationId);
+      if (!profile) continue;
 
-    console.log(
-      `✅ [${correlationId}] Identified by phone. Past questions: ${profile.totalQuestionsAsked}`,
-    );
-    return profile;
+      console.log(`  → user ${win.user_id}: profile.phone=${profile.phone}`);
+
+      if (phonesMatch(phoneNumber, profile.phone)) {
+        const userProfile = mapProfileToUserProfile(profile, win.call_code);
+        userProfile.totalQuestionsAsked = await getTotalQuestionsAsked(
+          userProfile.userId,
+          correlationId,
+        );
+        console.log(
+          `✅ [${correlationId}] Identified by phone: ${userProfile.name}`,
+        );
+        return userProfile;
+      }
+    }
+
+    console.log(`🔍 [${correlationId}] No phone match found`);
+    return null;
   } catch (error) {
     console.error(`❌ [${correlationId}] Phone lookup error:`, error);
     return null;
@@ -79,31 +138,54 @@ export async function lookupUserByPhone(
 
 /**
  * Look up a user by their spoken/transcribed call code.
- * Matches against inbound_schedules.call_code (e.g. "VDA-ABC-123").
- * Also accepts the code without the VDA- prefix or dashes (speech-to-text artifacts).
+ * Accepts 6-character alphanumeric codes (e.g. "A3B7C2") as well as
+ * the old VDA-XXX-XXX format for backwards compatibility.
+ * Speech-to-text produces artifacts like spaces, lowercase — normalise all of it.
  */
 export async function lookupUserByCode(
   rawCode: string,
   correlationId: string,
 ): Promise<UserProfile | null> {
   try {
-    // Normalise: strip spaces, uppercase, try multiple formats
+    // Strip spaces, uppercase
     const clean = rawCode.replace(/\s+/g, "").toUpperCase();
+    // Also strip any dashes for normalisation
+    const stripped = clean.replace(/-/g, "");
 
-    // Build candidate codes from what speech-to-text might produce
-    const candidates = new Set<string>();
-    candidates.add(clean);
-    // "VDA ABC 123" → "VDA-ABC-123"
-    candidates.add(
-      clean.replace(/([A-Z]{3})([A-Z0-9]{3})([A-Z0-9]{3})/, "$1-$2-$3"),
+    console.log(
+      `🔑 [${correlationId}] Code lookup — raw: "${rawCode}", clean: "${clean}", stripped: "${stripped}"`,
     );
-    // If only 6 chars were heard, try prefixing VDA-
-    if (clean.length === 6)
-      candidates.add(`VDA-${clean.slice(0, 3)}-${clean.slice(3)}`);
 
-    for (const code of candidates) {
-      const response = await fetch(
-        `${ENV.SUPABASE_URL}/rest/v1/inbound_schedules?call_code=eq.${encodeURIComponent(code)}&status=eq.scheduled&select=call_code,user_id,profiles(id,first_name,last_name,phone,user_type,occupation,legacy_goal,other_name,other_relationship)`,
+    // Build candidate codes to try in order
+    const candidates: string[] = [];
+
+    // 1. Exact as-spoken (normalised)
+    candidates.push(clean);
+
+    // 2. Stripped (no dashes) — for 6-char codes
+    if (stripped !== clean) candidates.push(stripped);
+
+    // 3. Legacy VDA-XXX-XXX: if user said "VDA ABC 123" → "VDAABC123" → "VDA-ABC-123"
+    if (stripped.length === 9) {
+      candidates.push(
+        `${stripped.slice(0, 3)}-${stripped.slice(3, 6)}-${stripped.slice(6)}`,
+      );
+    }
+
+    // 4. If only 6 chars, try wrapping in VDA- prefix (old format users)
+    if (stripped.length === 6) {
+      candidates.push(`VDA-${stripped.slice(0, 3)}-${stripped.slice(3)}`);
+    }
+
+    for (const code of [...new Set(candidates)]) {
+      if (code.length < 4) continue; // skip noise
+
+      // Step 1: find the schedule row with this code
+      const resp = await fetch(
+        `${ENV.SUPABASE_URL}/rest/v1/inbound_schedules` +
+          `?call_code=eq.${encodeURIComponent(code)}` +
+          `&status=eq.scheduled` +
+          `&select=call_code,user_id&limit=1`,
         {
           headers: {
             apikey: ENV.SUPABASE_SERVICE_KEY,
@@ -112,22 +194,29 @@ export async function lookupUserByCode(
         },
       );
 
-      if (!response.ok) continue;
-      const rows = await response.json();
-      if (!rows.length || !rows[0].profiles) continue;
+      if (!resp.ok) continue;
+      const rows: { call_code: string; user_id: string }[] = await resp.json();
+      if (!rows.length) continue;
 
-      const profile = mapProfileToUserProfile(rows[0].profiles, code);
-      profile.totalQuestionsAsked = await getTotalQuestionsAsked(
-        profile.userId,
+      // Step 2: fetch the profile for that user_id
+      const profile = await fetchProfileById(rows[0].user_id, correlationId);
+      if (!profile) continue;
+
+      const userProfile = mapProfileToUserProfile(profile, code);
+      userProfile.totalQuestionsAsked = await getTotalQuestionsAsked(
+        userProfile.userId,
         correlationId,
       );
 
       console.log(
-        `✅ [${correlationId}] Identified by code "${code}". Past questions: ${profile.totalQuestionsAsked}`,
+        `✅ [${correlationId}] Identified by code "${code}": ${userProfile.name}`,
       );
-      return profile;
+      return userProfile;
     }
 
+    console.log(
+      `❌ [${correlationId}] No match for candidates: ${[...new Set(candidates)].join(", ")}`,
+    );
     return null;
   } catch (error) {
     console.error(`❌ [${correlationId}] Code lookup error:`, error);
@@ -136,7 +225,6 @@ export async function lookupUserByCode(
 }
 
 function mapProfileToUserProfile(profile: any, callCode: string): UserProfile {
-  // Map profiles.user_type → server's UserProfile.userType enum
   const typeMap: Record<string, UserProfile["userType"]> = {
     ceo: "ceo_founder",
     founder: "ceo_founder",
@@ -161,9 +249,7 @@ function mapProfileToUserProfile(profile: any, callCode: string): UserProfile {
     userId: profile.id,
     name,
     userType,
-    company: undefined,
     role: profile.occupation || undefined,
-    industry: undefined,
     familyContext: profile.other_relationship
       ? `Calling on behalf of: ${profile.other_name || "a loved one"} (${profile.other_relationship})`
       : undefined,
@@ -214,7 +300,7 @@ export async function saveQuestionProgress(
         "Content-Type": "application/json",
         Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
         apikey: ENV.SUPABASE_SERVICE_KEY,
-        Prefer: "return=minimal",
+        Prefer: "return=minimal,resolution=ignore-duplicates",
       },
       body: JSON.stringify({
         user_id: userId,
@@ -268,7 +354,12 @@ export async function createInboundSession(
         }),
       },
     );
-    if (!response.ok) return null;
+    if (!response.ok) {
+      console.error(
+        `❌ [${correlationId}] createInboundSession failed: ${await response.text()}`,
+      );
+      return null;
+    }
     const rows = await response.json();
     return rows[0]?.id || null;
   } catch (error) {
@@ -356,7 +447,6 @@ export async function saveRecording(
   correlationId: string,
 ): Promise<void> {
   try {
-    // Save to call_recordings (the table from our schema)
     await fetch(`${ENV.SUPABASE_URL}/rest/v1/call_recordings`, {
       method: "POST",
       headers: {
@@ -377,6 +467,8 @@ export async function saveRecording(
     console.error(`❌ [${correlationId}] Save recording error:`, error);
   }
 }
+
+// ─── EVENT LOGGING ────────────────────────────────────────────────────────────
 
 export async function logEvent(
   sessionId: string,

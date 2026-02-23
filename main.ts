@@ -13,7 +13,7 @@ Deno.serve(async (req: Request) => {
     return Response.json({
       status: "running",
       service: "Veda Inbound AI Voice Server",
-      version: "2.0.0",
+      version: "2.1.0",
       active_sessions: activeSessions.size,
     });
   }
@@ -26,6 +26,7 @@ Deno.serve(async (req: Request) => {
     });
   }
 
+  // GET /voice — AT uses this for a quick connectivity check
   if (req.method === "GET" && url.pathname === "/voice") {
     return new Response(
       `<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="woman">Hello. This is Veda. Your voice system is working correctly.</Say></Response>`,
@@ -33,27 +34,38 @@ Deno.serve(async (req: Request) => {
     );
   }
 
-  // ── Core voice flow ──────────────────────────────────────────────────────────
+  // POST /voice — real inbound call from Africa's Talking
   if (req.method === "POST" && url.pathname === "/voice") {
     return handleVoiceCallback(req, correlationId);
   }
 
-  // Step 1: Receive recording, return instant filler + redirect
+  // POST /recording — AT sends recording details here
   if (req.method === "POST" && url.pathname === "/recording") {
     return handleRecordingCallback(req, correlationId);
   }
 
-  // Step 2: Do heavy AI work, return real response
-  // AT sends this as GET (following the <Redirect>)
-  if (req.method === "GET" && url.pathname === "/ai_thinking") {
+  // ── /ai_thinking ─────────────────────────────────────────────────────────────
+  // IMPORTANT: Africa's Talking sends a POST when following a <Redirect>.
+  // We must accept BOTH GET and POST here.
+  if (
+    (req.method === "GET" || req.method === "POST") &&
+    url.pathname === "/ai_thinking"
+  ) {
     return handleAIThinking(req, correlationId);
   }
 
+  console.warn(`⚠️  [${correlationId}] 404: ${req.method} ${url.pathname}`);
   return new Response(
-    JSON.stringify({ error: "Not Found", path: url.pathname }),
+    JSON.stringify({
+      error: "Not Found",
+      path: url.pathname,
+      method: req.method,
+    }),
     { status: 404, headers: { "Content-Type": "application/json" } },
   );
 });
 
-console.log("🚀 Veda Inbound AI Voice Server v2.0");
-console.log("📞 Endpoints: POST /voice | POST /recording | GET /ai_thinking");
+console.log("🚀 Veda Inbound AI Voice Server v2.1");
+console.log(
+  "📞 Endpoints: POST /voice | POST /recording | GET+POST /ai_thinking",
+);
