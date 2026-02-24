@@ -1,7 +1,7 @@
 import { ENV } from "./config/env.ts";
 import { handleVoiceCallback } from "./voice/voiceHandler.ts";
 import { activeSessions } from "./voice/sessionStore.ts";
-import { handleRecordingCallback } from "./voice/Conversationhandler.ts";
+import { handleRecordingCallback } from "./voice/converseHandler.ts";
 
 Deno.serve(async (req: Request) => {
   const url = new URL(req.url);

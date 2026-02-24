@@ -10,7 +10,7 @@ import {
 import { buildVoiceXML } from "./voiceXml.ts";
 import { sanitizePhoneNumber } from "../security/helpers.ts";
 import { AfricasTalkingAction, InboundSession } from "../types/voice.ts";
-import { deliverGreetingAndFirstQuestion } from "./Conversationhandler.ts";
+import { deliverGreetingAndFirstQuestion } from "./converseHandler.ts";
 
 export async function handleVoiceCallback(
   req: Request,
