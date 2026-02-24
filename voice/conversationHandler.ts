@@ -1,10 +1,16 @@
 /**
- * AI Thinking Handler
+ * Conversation Handler — Single-step recording + AI response
  *
- * Step 2 of the latency bridge:
- * - Called after /recording returns filler + <Redirect>
- * - Gets recording URL from: (1) query param [reliable] or (2) session memory [fallback]
- * - Downloads audio → transcribes → gets AI decision → returns next XML
+ * Africa's Talking calls this endpoint (POST) when a <Record> finishes.
+ * We do everything here in one shot:
+ *   1. Download the audio
+ *   2. Transcribe with Whisper
+ *   3. Get AI decision from Claude
+ *   4. Return the next XML (Say + Record) immediately
+ *
+ * No redirect, no second endpoint, no cross-isolate session state issues.
+ * The user hears a few seconds of silence while we process — this is fine
+ * and far better than a dropped call.
  */
 
 import { ENV } from "../config/env.ts";
@@ -33,132 +39,135 @@ import {
   InboundSession,
 } from "../types/voice.ts";
 
-export async function handleAIThinking(
+export async function handleRecordingCallback(
   req: Request,
   correlationId: string,
 ): Promise<Response> {
   try {
+    const formData = await req.formData();
     const url = new URL(req.url);
-    const sessionId = url.searchParams.get("sessionId");
-    const phase = url.searchParams.get("phase") || "conversation";
-    const durationSeconds = parseInt(
-      url.searchParams.get("durationSeconds") || "0",
+
+    // Log everything AT sends — helps debugging
+    const fields: Record<string, string> = {};
+    for (const [k, v] of formData.entries()) fields[k] = v.toString();
+    console.log(
+      `📼 [${correlationId}] Recording fields:`,
+      JSON.stringify(fields),
     );
 
-    // ── Get recording URL from query param (primary) or session (fallback) ──────
-    const recordingUrlFromParam = url.searchParams.get("recordingUrl");
-    const questionIdFromParam = url.searchParams.get("questionId") || "";
-    const turnIndexFromParam = parseInt(
-      url.searchParams.get("turnIndex") || "0",
+    const recordingUrl = formData.get("recordingUrl") as string;
+    const durationInSeconds = parseInt(
+      (formData.get("durationInSeconds") as string) || "0",
+    );
+    const sessionId = url.searchParams.get("sessionId");
+    const phase = url.searchParams.get("phase") || "conversation";
+    const questionId = url.searchParams.get("questionId") || "";
+    const turnIndex = parseInt(url.searchParams.get("turnIndex") || "0");
+
+    console.log(
+      `📼 [${correlationId}] session=${sessionId} phase=${phase} turn=${turnIndex} recordingUrl=${recordingUrl ? "present" : "MISSING"}`,
     );
 
     if (!sessionId) {
       console.error(`❌ [${correlationId}] No sessionId`);
-      return errorResponse();
+      return errorXml(
+        "I'm sorry, there was a connection issue. Please call back.",
+      );
+    }
+
+    if (!recordingUrl) {
+      // AT sometimes sends the callback before the recording is ready
+      // Return a brief hold message
+      console.warn(
+        `⚠️  [${correlationId}] No recordingUrl — AT may still be processing`,
+      );
+      return errorXml("One moment please, I'm still processing.");
     }
 
     const session = activeSessions.get(sessionId);
     if (!session) {
       console.error(`❌ [${correlationId}] Session not found: ${sessionId}`);
-      return errorResponse();
-    }
-
-    // Prefer URL param over session memory (cross-instance reliable)
-    const recordingUrl = recordingUrlFromParam || session.pendingRecordingUrl;
-    const turnIndex = turnIndexFromParam ?? session.pendingTurnIndex;
-    const questionId = questionIdFromParam || session.pendingQuestionId;
-
-    if (!recordingUrl) {
-      console.error(
-        `❌ [${correlationId}] No recording URL for session ${sessionId}`,
+      return errorXml(
+        "I'm sorry, your session has expired. Please call back to continue.",
       );
-      return errorResponse();
     }
 
-    console.log(
-      `🎯 [${correlationId}] ai_thinking — phase: ${phase}, turn: ${turnIndex}, recording: ${recordingUrl.substring(0, 60)}...`,
-    );
-
-    // Clear pending state immediately
-    session.pendingRecordingUrl = null;
+    session.lastActivity = new Date().toISOString();
     activeSessions.set(sessionId, session);
 
-    // ── Download audio ────────────────────────────────────────────────────────
-    const controller = new AbortController();
-    const timeoutId = setTimeout(
-      () => controller.abort(),
-      ENV.FETCH_TIMEOUT_MS,
+    // ── Download audio ─────────────────────────────────────────────────────────
+    console.log(
+      `⬇️  [${correlationId}] Downloading audio from: ${recordingUrl}`,
     );
     let audioBuffer: ArrayBuffer;
 
     try {
-      console.log(`⬇️  [${correlationId}] Downloading audio...`);
-      const audioResponse = await fetch(recordingUrl, {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(
+        () => controller.abort(),
+        ENV.FETCH_TIMEOUT_MS,
+      );
+
+      const audioResp = await fetch(recordingUrl, {
         signal: controller.signal,
       });
       clearTimeout(timeoutId);
 
-      if (!audioResponse.ok) {
-        throw new Error(`Audio download failed: ${audioResponse.status}`);
+      if (!audioResp.ok) {
+        throw new Error(`HTTP ${audioResp.status}`);
       }
-
-      audioBuffer = await audioResponse.arrayBuffer();
+      audioBuffer = await audioResp.arrayBuffer();
       console.log(
-        `✅ [${correlationId}] Downloaded ${(audioBuffer.byteLength / 1024).toFixed(1)}KB`,
+        `✅ [${correlationId}] Audio downloaded: ${(audioBuffer.byteLength / 1024).toFixed(1)}KB, duration: ${durationInSeconds}s`,
       );
-
-      if (audioBuffer.byteLength < 1000) {
-        console.warn(
-          `⚠️  [${correlationId}] Audio very small (${audioBuffer.byteLength} bytes) — may be empty`,
-        );
-      }
     } catch (err) {
-      clearTimeout(timeoutId);
-      console.error(`❌ [${correlationId}] Audio download error:`, err);
-      return errorResponse();
+      console.error(`❌ [${correlationId}] Audio download failed:`, err);
+      return errorXml(
+        "I had trouble receiving your recording. Could you please speak again?",
+      );
     }
 
-    // ── Background upload (non-blocking) ─────────────────────────────────────
-    const storagePath = `inbound/${session.userId}/${sessionId}/turn-${turnIndex}-${Date.now()}.mp3`;
-    uploadToSupabase(
-      audioBuffer,
-      storagePath,
-      sessionId,
-      session.userId,
-      questionId,
-      `Turn ${turnIndex + 1}`,
-      turnIndex,
-      durationSeconds,
-      correlationId,
-    ).catch((err) =>
-      console.error(`❌ [${correlationId}] Background upload failed:`, err),
-    );
+    // ── Background upload (fire and forget) ───────────────────────────────────
+    if (session.userId && audioBuffer.byteLength > 500) {
+      const storagePath = `inbound/${session.userId}/${sessionId}/turn-${turnIndex}-${Date.now()}.mp3`;
+      uploadToSupabase(
+        audioBuffer,
+        storagePath,
+        sessionId,
+        session.userId,
+        questionId,
+        `Turn ${turnIndex + 1}`,
+        turnIndex,
+        durationInSeconds,
+        correlationId,
+      ).catch((e) => console.error(`❌ Upload failed:`, e));
+    }
 
-    // ── Identification phase ──────────────────────────────────────────────────
+    // ── Route by phase ─────────────────────────────────────────────────────────
     if (phase === "identification" || phase === "identification_retry") {
       return await handleIdentification(
         session,
         sessionId,
         audioBuffer,
+        phase,
         correlationId,
       );
     }
 
-    // ── Transcribe ────────────────────────────────────────────────────────────
+    // ── Transcribe ─────────────────────────────────────────────────────────────
     console.log(`🎤 [${correlationId}] Transcribing...`);
     const transcript = await transcribeAudio(audioBuffer, correlationId);
     console.log(
-      `📝 [${correlationId}] Transcript: "${transcript.substring(0, 150)}"`,
+      `📝 [${correlationId}] Transcript (${transcript.length} chars): "${transcript.substring(0, 150)}"`,
     );
 
-    // Empty transcript → prompt again with same question
     if (!transcript.trim()) {
       console.warn(`⚠️  [${correlationId}] Empty transcript`);
       return new Response(
         buildVoiceXML([
           {
             say: {
-              text: "I didn't quite catch that. Take your time — whenever you're ready, please go ahead.",
+              text: "I didn't quite catch that. Please go ahead whenever you're ready.",
               voice: "woman",
               playBeep: false,
             },
@@ -178,7 +187,7 @@ export async function handleAIThinking(
       );
     }
 
-    // ── Save user's turn ──────────────────────────────────────────────────────
+    // ── Save user turn ─────────────────────────────────────────────────────────
     const userTurn: ConversationTurn = {
       role: "user",
       content: transcript,
@@ -186,11 +195,8 @@ export async function handleAIThinking(
       questionId,
       audioUrl: recordingUrl,
     };
-
     session.conversationHistory.push(userTurn);
-    session.lastActivity = new Date().toISOString();
     activeSessions.set(sessionId, session);
-
     await saveConversationTurn(
       sessionId,
       session.userId,
@@ -198,23 +204,22 @@ export async function handleAIThinking(
       correlationId,
     );
 
-    // ── Decide: wrap up or continue? ──────────────────────────────────────────
+    // ── AI decision ────────────────────────────────────────────────────────────
     const sessionQCount = session.sessionQuestionsAsked.length;
-    const shouldEndSession = sessionQCount >= ENV.QUESTIONS_PER_SESSION;
+    const shouldWrap = sessionQCount >= ENV.QUESTIONS_PER_SESSION;
 
     let decision: AIDecision;
-
-    if (shouldEndSession) {
+    if (shouldWrap) {
       console.log(
-        `📋 [${correlationId}] Session limit reached (${sessionQCount}/${ENV.QUESTIONS_PER_SESSION}). Wrapping up.`,
+        `📋 [${correlationId}] Session limit (${sessionQCount}/${ENV.QUESTIONS_PER_SESSION}). Wrapping up.`,
       );
-      decision = await getSessionWrapUp(session);
+      decision = buildWrapUp(session);
     } else {
-      console.log(`🧠 [${correlationId}] Getting AI decision...`);
+      console.log(`🧠 [${correlationId}] Calling Claude for decision...`);
       decision = await getAIDecision(session, transcript);
     }
 
-    // ── Update counters ───────────────────────────────────────────────────────
+    // ── Update tracking ────────────────────────────────────────────────────────
     if (decision.action === "follow_up") {
       session.followUpCount += 1;
     } else if (decision.action === "ask_question" && decision.questionId) {
@@ -222,7 +227,6 @@ export async function handleAIThinking(
       session.sessionQuestionsAsked.push(decision.questionId);
       session.globalQuestionsAsked.push(decision.questionId);
       session.currentQuestionId = decision.questionId;
-
       if (session.userId) {
         await saveQuestionProgress(
           session.userId,
@@ -233,7 +237,7 @@ export async function handleAIThinking(
       }
     }
 
-    // ── Save Veda's turn ──────────────────────────────────────────────────────
+    // ── Save Veda turn ─────────────────────────────────────────────────────────
     const vedaTurn: ConversationTurn = {
       role: "veda",
       content: decision.speech,
@@ -241,10 +245,8 @@ export async function handleAIThinking(
       questionId: decision.questionId,
       isFollowUp: decision.action === "follow_up",
     };
-
     session.conversationHistory.push(vedaTurn);
     activeSessions.set(sessionId, session);
-
     await saveConversationTurn(
       sessionId,
       session.userId,
@@ -252,7 +254,7 @@ export async function handleAIThinking(
       correlationId,
     );
 
-    // ── Build response XML ────────────────────────────────────────────────────
+    // ── Build XML response ─────────────────────────────────────────────────────
     const nextTurnIndex = turnIndex + 1;
     const actions: AfricasTalkingAction[] = [
       { say: { text: decision.speech, voice: "woman", playBeep: false } },
@@ -275,8 +277,7 @@ export async function handleAIThinking(
         },
         correlationId,
       );
-
-      setTimeout(() => activeSessions.delete(sessionId), 20000);
+      setTimeout(() => activeSessions.delete(sessionId), 30000);
 
       return new Response(buildVoiceXML(actions), {
         status: 200,
@@ -285,7 +286,6 @@ export async function handleAIThinking(
     }
 
     const nextQuestionId = decision.questionId ?? questionId;
-
     actions.push({
       record: {
         maxLength: ENV.RECORDING_MAX_LENGTH_SECONDS,
@@ -302,8 +302,8 @@ export async function handleAIThinking(
       headers: { "Content-Type": "text/xml" },
     });
   } catch (error) {
-    console.error(`❌ [${correlationId}] AI thinking handler error:`, error);
-    return errorResponse();
+    console.error(`❌ [${correlationId}] Conversation handler error:`, error);
+    return errorXml("I had a brief technical issue. Could you say that again?");
   }
 }
 
@@ -313,25 +313,23 @@ async function handleIdentification(
   session: InboundSession,
   sessionId: string,
   audioBuffer: ArrayBuffer,
+  phase: string,
   correlationId: string,
 ): Promise<Response> {
   const transcript = await transcribeAudio(audioBuffer, correlationId);
-  console.log(`🔑 [${correlationId}] Code attempt: "${transcript}"`);
+  console.log(`🔑 [${correlationId}] Code spoken: "${transcript}"`);
 
   const profile = await lookupUserByCode(transcript, correlationId);
 
   if (!profile) {
-    const isRetry = session.phase === "identification_retry";
-
+    const isRetry = phase === "identification_retry";
     if (isRetry) {
-      console.warn(
-        `⚠️  [${correlationId}] Two failed code attempts. Ending call.`,
-      );
+      console.warn(`⚠️  [${correlationId}] Two failed attempts. Ending.`);
       return new Response(
         buildVoiceXML([
           {
             say: {
-              text: "I'm sorry, I wasn't able to verify your access code. Please check your registration email for your code and give us a call back. Goodbye.",
+              text: "I wasn't able to verify your access code after two attempts. Please check your code in the app and call back when you're ready. Goodbye.",
               voice: "woman",
               playBeep: false,
             },
@@ -348,14 +346,14 @@ async function handleIdentification(
       buildVoiceXML([
         {
           say: {
-            text: "I'm sorry, I didn't catch that clearly. Could you please say your 6-character access code slowly and clearly? Press the hash key when you're done.",
+            text: "I'm sorry, I didn't catch that clearly. Please say your 6-character access code slowly and clearly, then press the hash key.",
             voice: "woman",
             playBeep: false,
           },
         },
         {
           record: {
-            maxLength: 15,
+            maxLength: 20,
             timeout: 5,
             finishOnKey: "#",
             trimSilence: true,
@@ -368,7 +366,7 @@ async function handleIdentification(
     );
   }
 
-  console.log(`✅ [${correlationId}] Identity confirmed: ${profile.name}`);
+  console.log(`✅ [${correlationId}] Confirmed: ${profile.name}`);
 
   const globalProgress = await getUserQuestionProgress(
     profile.userId,
@@ -414,7 +412,7 @@ async function handleIdentification(
 
 // ─── Greeting + first question ────────────────────────────────────────────────
 
-async function deliverGreetingAndFirstQuestion(
+export async function deliverGreetingAndFirstQuestion(
   session: InboundSession,
   sessionId: string,
   correlationId: string,
@@ -433,7 +431,6 @@ async function deliverGreetingAndFirstQuestion(
     timestamp: new Date().toISOString(),
     questionId: firstQ.questionId,
   });
-
   session.sessionQuestionsAsked.push(firstQ.questionId);
   session.globalQuestionsAsked.push(firstQ.questionId);
   session.currentQuestionId = firstQ.questionId;
@@ -492,26 +489,21 @@ async function deliverGreetingAndFirstQuestion(
 
 // ─── Session wrap-up ──────────────────────────────────────────────────────────
 
-async function getSessionWrapUp(session: InboundSession): Promise<AIDecision> {
+function buildWrapUp(session: InboundSession): AIDecision {
   const name = session.userProfile?.name?.split(" ")[0] || "there";
   const globalCount = session.globalQuestionsAsked.length;
-  const totalNeeded = ENV.MIN_QUESTIONS_FOR_MODEL;
+  const remaining = ENV.MIN_QUESTIONS_FOR_MODEL - globalCount;
 
   let closingLine: string;
-
-  if (globalCount < totalNeeded) {
-    const remaining = totalNeeded - globalCount;
-    const sessionsLeft = Math.ceil(remaining / ENV.QUESTIONS_PER_SESSION);
-
-    if (sessionsLeft <= 1) {
-      closingLine = `We're getting very close to having everything we need — just one more session like this one should do it.`;
-    } else if (sessionsLeft <= 2) {
-      closingLine = `We're well on our way. Just a couple more conversations like this and we'll have something truly complete.`;
-    } else {
-      closingLine = `We're building something really meaningful here, one conversation at a time.`;
-    }
+  if (remaining <= 0) {
+    closingLine =
+      "I believe we now have a beautifully complete picture of your thinking and wisdom.";
+  } else if (remaining <= ENV.QUESTIONS_PER_SESSION) {
+    closingLine =
+      "We're very close — just one more session like this should do it.";
   } else {
-    closingLine = `I believe we now have a beautifully complete picture of your thinking and wisdom.`;
+    closingLine =
+      "We're building something meaningful here, one conversation at a time.";
   }
 
   return {
@@ -520,14 +512,14 @@ async function getSessionWrapUp(session: InboundSession): Promise<AIDecision> {
   };
 }
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 async function getUserSessionCount(
   userId: string,
   correlationId: string,
 ): Promise<number> {
   try {
-    const response = await fetch(
+    const resp = await fetch(
       `${ENV.SUPABASE_URL}/rest/v1/inbound_sessions?user_id=eq.${userId}&select=id`,
       {
         headers: {
@@ -536,24 +528,18 @@ async function getUserSessionCount(
         },
       },
     );
-    if (!response.ok) return 1;
-    const rows = await response.json();
+    if (!resp.ok) return 1;
+    const rows = await resp.json();
     return rows.length + 1;
   } catch {
     return 1;
   }
 }
 
-function errorResponse(): Response {
+function errorXml(message: string): Response {
   return new Response(
     buildVoiceXML([
-      {
-        say: {
-          text: "I'm sorry, I had a brief technical issue. Could you repeat what you just shared?",
-          voice: "woman",
-          playBeep: false,
-        },
-      },
+      { say: { text: message, voice: "woman", playBeep: false } },
     ]),
     { status: 200, headers: { "Content-Type": "text/xml" } },
   );

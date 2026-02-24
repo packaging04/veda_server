@@ -9,8 +9,8 @@ import {
 } from "../db/supabase.ts";
 import { buildVoiceXML } from "./voiceXml.ts";
 import { sanitizePhoneNumber } from "../security/helpers.ts";
-import { getGreeting, getFirstQuestion } from "./aiConversation.ts";
-import { saveConversationTurn, saveQuestionProgress } from "../db/supabase.ts";
+import { deliverGreetingAndFirstQuestion } from "./conversationHandler.ts";
+
 import { AfricasTalkingAction, InboundSession } from "../types/voice.ts";
 
 export async function handleVoiceCallback(
@@ -199,76 +199,11 @@ async function handleGreetingPhase(
   sessionId: string,
   correlationId: string,
 ): Promise<Response> {
-  const greetingText = await getGreeting(session);
-  const firstQ = await getFirstQuestion(session);
-
-  session.conversationHistory.push({
-    role: "veda",
-    content: greetingText,
-    timestamp: new Date().toISOString(),
-  });
-  session.conversationHistory.push({
-    role: "veda",
-    content: firstQ.speech,
-    timestamp: new Date().toISOString(),
-    questionId: firstQ.questionId,
-  });
-  session.sessionQuestionsAsked.push(firstQ.questionId);
-  session.globalQuestionsAsked.push(firstQ.questionId);
-  session.currentQuestionId = firstQ.questionId;
-  session.phase = "conversation";
-  activeSessions.set(sessionId, session);
-
-  if (session.userId) {
-    await saveQuestionProgress(
-      session.userId,
-      firstQ.questionId,
-      sessionId,
-      correlationId,
-    );
-  }
-
-  await saveConversationTurn(
+  // Delegate to conversationHandler which handles greeting + first question + Record
+  return await deliverGreetingAndFirstQuestion(
+    session,
     sessionId,
-    session.userId,
-    {
-      role: "veda",
-      content: greetingText,
-      timestamp: new Date().toISOString(),
-    },
     correlationId,
-  );
-  await saveConversationTurn(
-    sessionId,
-    session.userId,
-    {
-      role: "veda",
-      content: firstQ.speech,
-      timestamp: new Date().toISOString(),
-      questionId: firstQ.questionId,
-      isFollowUp: false,
-    },
-    correlationId,
-  );
-
-  return new Response(
-    buildVoiceXML([
-      { say: { text: greetingText, voice: "woman", playBeep: false } },
-      { pause: { length: 1 } },
-      { say: { text: firstQ.speech, voice: "woman", playBeep: false } },
-      { pause: { length: 1 } },
-      {
-        record: {
-          maxLength: ENV.RECORDING_MAX_LENGTH_SECONDS,
-          timeout: ENV.RECORDING_TIMEOUT_SECONDS,
-          finishOnKey: "#",
-          trimSilence: true,
-          playBeep: false,
-          callbackUrl: `${ENV.BASE_URL}/recording?sessionId=${sessionId}&phase=conversation&questionId=${firstQ.questionId}&turnIndex=0`,
-        },
-      },
-    ]),
-    { status: 200, headers: { "Content-Type": "text/xml" } },
   );
 }
 
