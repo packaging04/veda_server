@@ -34,6 +34,97 @@ CONVERSATION STYLE:
 - Mirror the energy of the person: if they're reflective and slow, slow down; if they're animated, match it slightly
 - Use the person's name occasionally but not on every turn — it should feel natural, not scripted`;
 
+/**
+ * Fast AI decision using Claude Haiku — used in the live call path.
+ * Haiku responds in 1–2s vs Sonnet's 4–7s, critical for staying under AT's 15s timeout.
+ * Quality is excellent for this use case (short, warm conversational responses).
+ */
+export async function getAIDecisionFast(
+  session: InboundSession,
+  latestUserInput: string,
+): Promise<AIDecision> {
+  const availableQuestions = getQuestionsForUser(
+    session.userProfile?.userType || "general",
+  ).filter(
+    (q) =>
+      !session.globalQuestionsAsked.includes(q.id) &&
+      !session.sessionQuestionsAsked.includes(q.id),
+  );
+
+  const shouldWrapUp = availableQuestions.length === 0;
+  const name = session.userProfile?.name?.split(" ")[0] || "";
+
+  // Compact conversation (last 6 turns max — enough context, minimal tokens)
+  const recentHistory = session.conversationHistory.slice(-6);
+  const conversationText = recentHistory
+    .map(
+      (t) => `${t.role === "veda" ? "Veda" : name || "Person"}: ${t.content}`,
+    )
+    .join("\n");
+
+  const availableQText = availableQuestions
+    .slice(0, 5)
+    .map((q) => `[${q.id}] ${q.text}`)
+    .join("\n");
+
+  // Compact prompt — fewer tokens = faster response
+  const prompt = `${VEDA_SYSTEM_PROMPT}
+
+USER: ${name ? `${name}, ` : ""}${session.userProfile?.userType || "general"} type.
+GLOBAL QUESTIONS ASKED: ${session.globalQuestionsAsked.length}. SESSION: ${session.sessionQuestionsAsked.length}/${ENV.QUESTIONS_PER_SESSION}.
+CONSECUTIVE FOLLOW-UPS: ${session.followUpCount}/${ENV.MAX_FOLLOW_UPS_PER_TOPIC}.
+
+RECENT CONVERSATION:
+${conversationText}
+
+PERSON JUST SAID: "${latestUserInput}"
+
+AVAILABLE QUESTIONS:
+${availableQText || "None — use end_session."}
+
+Respond ONLY with valid JSON (no markdown):
+{"speech":"...","action":"ask_question"|"follow_up"|"end_session","questionId":"id-if-asking","reasoning":"brief"}`;
+
+  try {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": ENV.ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 400,
+        messages: [{ role: "user", content: prompt }],
+      }),
+    });
+
+    if (!response.ok)
+      throw new Error(
+        `Claude API ${response.status}: ${await response.text()}`,
+      );
+
+    const data = await response.json();
+    const rawText = data.content[0]?.text || "";
+    const cleaned = rawText.replace(/```json|```/g, "").trim();
+    const decision: AIDecision = JSON.parse(cleaned);
+
+    console.log(
+      `⚡ Haiku decision: ${decision.action} — ${decision.reasoning || ""}`,
+    );
+    return decision;
+  } catch (error) {
+    console.error("❌ Haiku decision error:", error);
+    // Graceful fallback
+    return {
+      speech:
+        "That's really thoughtful. Could you tell me a bit more about what shaped that perspective for you?",
+      action: "follow_up",
+    };
+  }
+}
+
 export async function getAIDecision(
   session: InboundSession,
   latestUserInput: string,

@@ -1,16 +1,20 @@
 /**
- * Conversation Handler — Single-step recording + AI response
+ * AI Thinking Handler — Step 2 of the latency bridge
  *
- * Africa's Talking calls this endpoint (POST) when a <Record> finishes.
- * We do everything here in one shot:
- *   1. Download the audio
- *   2. Transcribe with Whisper
- *   3. Get AI decision from Claude
- *   4. Return the next XML (Say + Record) immediately
+ * AT follows the <Redirect> from /recording, giving us a fresh 15-second window.
+ * By this point the filler phrase has played (~4s), so audio download has a head start
+ * if we fire it immediately.
  *
- * No redirect, no second endpoint, no cross-isolate session state issues.
- * The user hears a few seconds of silence while we process — this is fine
- * and far better than a dropped call.
+ * Speed budget:
+ *   Download audio from at-internal.com:  2–4s
+ *   Whisper transcription:                4–6s
+ *   Claude Haiku decision:                1–2s   ← Haiku not Sonnet (3–4x faster)
+ *   Supabase saves (non-blocking):        0s (fire-and-forget)
+ *   ─────────────────────────────────────────
+ *   Total:                                7–12s  ✓ well under 15s
+ *
+ * AT sends this as POST when following a <Redirect> (not GET).
+ * main.ts accepts both GET and POST on /ai_thinking.
  */
 
 import { ENV } from "../config/env.ts";
@@ -28,7 +32,7 @@ import {
 import { buildVoiceXML } from "./voiceXml.ts";
 import { transcribeAudio } from "../background/transcription.ts";
 import {
-  getAIDecision,
+  getAIDecisionFast,
   getGreeting,
   getFirstQuestion,
 } from "./aiConversation.ts";
@@ -39,97 +43,76 @@ import {
   InboundSession,
 } from "../types/voice.ts";
 
-export async function handleRecordingCallback(
+export async function handleAIThinking(
   req: Request,
   correlationId: string,
 ): Promise<Response> {
+  const startTime = Date.now();
+
   try {
-    const formData = await req.formData();
     const url = new URL(req.url);
-
-    // Log everything AT sends — helps debugging
-    const fields: Record<string, string> = {};
-    for (const [k, v] of formData.entries()) fields[k] = v.toString();
-    console.log(
-      `📼 [${correlationId}] Recording fields:`,
-      JSON.stringify(fields),
-    );
-
-    const recordingUrl = formData.get("recordingUrl") as string;
-    const durationInSeconds = parseInt(
-      (formData.get("durationInSeconds") as string) || "0",
-    );
     const sessionId = url.searchParams.get("sessionId");
     const phase = url.searchParams.get("phase") || "conversation";
-    const questionId = url.searchParams.get("questionId") || "";
-    const turnIndex = parseInt(url.searchParams.get("turnIndex") || "0");
-
-    console.log(
-      `📼 [${correlationId}] session=${sessionId} phase=${phase} turn=${turnIndex} recordingUrl=${recordingUrl ? "present" : "MISSING"}`,
+    const durationSeconds = parseInt(
+      url.searchParams.get("durationSeconds") || "0",
     );
+    const recordingUrlParam = url.searchParams.get("recordingUrl");
+    const questionIdParam = url.searchParams.get("questionId") || "";
+    const turnIndexParam = parseInt(url.searchParams.get("turnIndex") || "0");
 
-    if (!sessionId) {
-      console.error(`❌ [${correlationId}] No sessionId`);
-      return errorXml(
-        "I'm sorry, there was a connection issue. Please call back.",
-      );
-    }
-
-    if (!recordingUrl) {
-      // AT sometimes sends the callback before the recording is ready
-      // Return a brief hold message
-      console.warn(
-        `⚠️  [${correlationId}] No recordingUrl — AT may still be processing`,
-      );
-      return errorXml("One moment please, I'm still processing.");
-    }
+    if (!sessionId) return errorResponse();
 
     const session = activeSessions.get(sessionId);
     if (!session) {
       console.error(`❌ [${correlationId}] Session not found: ${sessionId}`);
-      return errorXml(
-        "I'm sorry, your session has expired. Please call back to continue.",
-      );
+      return errorResponse();
     }
 
-    session.lastActivity = new Date().toISOString();
+    // Get recordingUrl: query param is primary (cross-isolate safe), session is fallback
+    const recordingUrl = recordingUrlParam || session.pendingRecordingUrl;
+    const turnIndex = turnIndexParam ?? session.pendingTurnIndex;
+    const questionId = questionIdParam || session.pendingQuestionId;
+
+    if (!recordingUrl) {
+      console.error(`❌ [${correlationId}] No recording URL`);
+      return errorResponse();
+    }
+
+    console.log(
+      `🧠 [${correlationId}] ai_thinking — phase=${phase} turn=${turnIndex} (${Date.now() - startTime}ms since entry)`,
+    );
+
+    // Clear pending state
+    session.pendingRecordingUrl = null;
     activeSessions.set(sessionId, session);
 
     // ── Download audio ─────────────────────────────────────────────────────────
-    console.log(
-      `⬇️  [${correlationId}] Downloading audio from: ${recordingUrl}`,
-    );
+    const controller = new AbortController();
+    // Keep within 10s to leave room for Whisper + Haiku
+    const timeoutId = setTimeout(() => controller.abort(), 10000);
     let audioBuffer: ArrayBuffer;
 
     try {
-      const controller = new AbortController();
-      const timeoutId = setTimeout(
-        () => controller.abort(),
-        ENV.FETCH_TIMEOUT_MS,
+      console.log(
+        `⬇️  [${correlationId}] Downloading: ${recordingUrl.substring(0, 70)}...`,
       );
-
       const audioResp = await fetch(recordingUrl, {
         signal: controller.signal,
       });
       clearTimeout(timeoutId);
 
-      if (!audioResp.ok) {
-        throw new Error(`HTTP ${audioResp.status}`);
-      }
+      if (!audioResp.ok) throw new Error(`HTTP ${audioResp.status}`);
       audioBuffer = await audioResp.arrayBuffer();
       console.log(
-        `✅ [${correlationId}] Audio downloaded: ${(audioBuffer.byteLength / 1024).toFixed(1)}KB, duration: ${durationInSeconds}s`,
+        `✅ [${correlationId}] Downloaded ${(audioBuffer.byteLength / 1024).toFixed(1)}KB in ${Date.now() - startTime}ms`,
       );
     } catch (err) {
-      console.error(`❌ [${correlationId}] Audio download failed:`, err);
-      return errorXml(
-        "I had trouble receiving your recording. Could you please speak again?",
-      );
+      clearTimeout(timeoutId);
+      console.error(`❌ [${correlationId}] Download failed:`, err);
+      return errorResponse();
     }
 
-    // (recording saved after transcription below, so we have transcript too)
-
-    // ── Route by phase ─────────────────────────────────────────────────────────
+    // ── Identification phase ───────────────────────────────────────────────────
     if (phase === "identification" || phase === "identification_retry") {
       return await handleIdentification(
         session,
@@ -141,14 +124,13 @@ export async function handleRecordingCallback(
     }
 
     // ── Transcribe ─────────────────────────────────────────────────────────────
-    console.log(`🎤 [${correlationId}] Transcribing...`);
     const transcript = await transcribeAudio(audioBuffer, correlationId);
     console.log(
-      `📝 [${correlationId}] Transcript (${transcript.length} chars): "${transcript.substring(0, 150)}"`,
+      `📝 [${correlationId}] Transcribed in ${Date.now() - startTime}ms: "${transcript.substring(0, 100)}"`,
     );
 
+    // Empty transcript — re-prompt
     if (!transcript.trim()) {
-      console.warn(`⚠️  [${correlationId}] Empty transcript`);
       return new Response(
         buildVoiceXML([
           {
@@ -173,7 +155,7 @@ export async function handleRecordingCallback(
       );
     }
 
-    // ── Save user turn ─────────────────────────────────────────────────────────
+    // ── Save user turn (non-blocking) ──────────────────────────────────────────
     const userTurn: ConversationTurn = {
       role: "user",
       content: transcript,
@@ -182,42 +164,43 @@ export async function handleRecordingCallback(
       audioUrl: recordingUrl,
     };
     session.conversationHistory.push(userTurn);
+    session.lastActivity = new Date().toISOString();
     activeSessions.set(sessionId, session);
-    await saveConversationTurn(
+
+    // Fire DB saves in background — don't await in critical path
+    saveConversationTurn(
       sessionId,
       session.userId,
       userTurn,
       correlationId,
-    );
-
-    // ── Save recording URL + transcript to call_recordings ────────────────────
+    ).catch((e) => console.error(`❌ saveConversationTurn error:`, e));
     saveRecording(
       sessionId,
       session.userId,
       questionId,
-      `Question turn ${turnIndex + 1}`,
+      `Q${turnIndex + 1}`,
       turnIndex,
       recordingUrl,
       "",
-      durationInSeconds,
-      0,
+      durationSeconds,
+      audioBuffer.byteLength,
       correlationId,
       transcript,
     ).catch((e) => console.error(`❌ saveRecording error:`, e));
 
-    // ── AI decision ────────────────────────────────────────────────────────────
+    // ── AI decision (Haiku — fast) ─────────────────────────────────────────────
     const sessionQCount = session.sessionQuestionsAsked.length;
     const shouldWrap = sessionQCount >= ENV.QUESTIONS_PER_SESSION;
 
     let decision: AIDecision;
     if (shouldWrap) {
-      console.log(
-        `📋 [${correlationId}] Session limit (${sessionQCount}/${ENV.QUESTIONS_PER_SESSION}). Wrapping up.`,
-      );
       decision = buildWrapUp(session);
     } else {
-      console.log(`🧠 [${correlationId}] Calling Claude for decision...`);
-      decision = await getAIDecision(session, transcript);
+      console.log(`🧠 [${correlationId}] Calling Haiku for decision...`);
+      decision = await getAIDecisionFast(session, transcript);
+      console.log(
+        `🧠 [${correlationId}] Decision in ${Date.now() - startTime}ms: ${decision.action}`,
+      );
     }
 
     // ── Update tracking ────────────────────────────────────────────────────────
@@ -228,17 +211,15 @@ export async function handleRecordingCallback(
       session.sessionQuestionsAsked.push(decision.questionId);
       session.globalQuestionsAsked.push(decision.questionId);
       session.currentQuestionId = decision.questionId;
-      if (session.userId) {
-        await saveQuestionProgress(
-          session.userId,
-          decision.questionId,
-          sessionId,
-          correlationId,
-        );
-      }
+      saveQuestionProgress(
+        session.userId,
+        decision.questionId,
+        sessionId,
+        correlationId,
+      ).catch((e) => console.error(`❌ saveQuestionProgress error:`, e));
     }
 
-    // ── Save Veda turn ─────────────────────────────────────────────────────────
+    // ── Save Veda turn (non-blocking) ─────────────────────────────────────────
     const vedaTurn: ConversationTurn = {
       role: "veda",
       content: decision.speech,
@@ -248,36 +229,38 @@ export async function handleRecordingCallback(
     };
     session.conversationHistory.push(vedaTurn);
     activeSessions.set(sessionId, session);
-    await saveConversationTurn(
+    saveConversationTurn(
       sessionId,
       session.userId,
       vedaTurn,
       correlationId,
-    );
+    ).catch((e) => console.error(`❌ saveConversationTurn (veda) error:`, e));
 
-    // ── Build XML response ─────────────────────────────────────────────────────
+    // ── Build XML ──────────────────────────────────────────────────────────────
+    const totalMs = Date.now() - startTime;
+    console.log(`⚡ [${correlationId}] Total processing: ${totalMs}ms`);
+
     const nextTurnIndex = turnIndex + 1;
     const actions: AfricasTalkingAction[] = [
       { say: { text: decision.speech, voice: "woman", playBeep: false } },
     ];
 
     if (decision.action === "end_session") {
-      await updateInboundSessionStatus(
+      updateInboundSessionStatus(
         sessionId,
         "completed",
         session.sessionQuestionsAsked.length,
         correlationId,
-      );
-      await logEvent(
+      ).catch(() => {});
+      logEvent(
         sessionId,
         "session_completed",
         {
-          session_questions: session.sessionQuestionsAsked.length,
-          global_questions: session.globalQuestionsAsked.length,
           total_turns: session.conversationHistory.length,
+          total_ms: totalMs,
         },
         correlationId,
-      );
+      ).catch(() => {});
       setTimeout(() => activeSessions.delete(sessionId), 30000);
 
       return new Response(buildVoiceXML(actions), {
@@ -303,8 +286,8 @@ export async function handleRecordingCallback(
       headers: { "Content-Type": "text/xml" },
     });
   } catch (error) {
-    console.error(`❌ [${correlationId}] Conversation handler error:`, error);
-    return errorXml("I had a brief technical issue. Could you say that again?");
+    console.error(`❌ [${correlationId}] AI thinking error:`, error);
+    return errorResponse();
   }
 }
 
@@ -318,19 +301,17 @@ async function handleIdentification(
   correlationId: string,
 ): Promise<Response> {
   const transcript = await transcribeAudio(audioBuffer, correlationId);
-  console.log(`🔑 [${correlationId}] Code spoken: "${transcript}"`);
+  console.log(`🔑 [${correlationId}] Code: "${transcript}"`);
 
   const profile = await lookupUserByCode(transcript, correlationId);
 
   if (!profile) {
-    const isRetry = phase === "identification_retry";
-    if (isRetry) {
-      console.warn(`⚠️  [${correlationId}] Two failed attempts. Ending.`);
+    if (phase === "identification_retry") {
       return new Response(
         buildVoiceXML([
           {
             say: {
-              text: "I wasn't able to verify your access code after two attempts. Please check your code in the app and call back when you're ready. Goodbye.",
+              text: "I wasn't able to verify your access code. Please check your code in the app and call back when you're ready. Goodbye.",
               voice: "woman",
               playBeep: false,
             },
@@ -347,7 +328,7 @@ async function handleIdentification(
       buildVoiceXML([
         {
           say: {
-            text: "I'm sorry, I didn't catch that clearly. Please say your 6-character access code slowly and clearly, then press the hash key.",
+            text: "I didn't catch that clearly. Please say your 6-character access code slowly and clearly, then press the hash key.",
             voice: "woman",
             playBeep: false,
           },
@@ -385,24 +366,20 @@ async function handleIdentification(
   session.phase = "greeting";
   activeSessions.set(sessionId, session);
 
-  await createInboundSession(
+  createInboundSession(
     sessionId,
     profile.userId,
     session.callerPhone,
     false,
     sessionNumber,
     correlationId,
-  );
-  await logEvent(
+  ).catch(() => {});
+  logEvent(
     sessionId,
     "identity_confirmed",
-    {
-      method: "access_code",
-      user_type: profile.userType,
-      past_questions: globalProgress.length,
-    },
+    { method: "access_code", user_type: profile.userType },
     correlationId,
-  );
+  ).catch(() => {});
 
   return await deliverGreetingAndFirstQuestion(
     session,
@@ -438,16 +415,16 @@ export async function deliverGreetingAndFirstQuestion(
   session.phase = "conversation";
   activeSessions.set(sessionId, session);
 
+  // Non-blocking DB saves
   if (session.userId && firstQ.questionId !== "fallback-first") {
-    await saveQuestionProgress(
+    saveQuestionProgress(
       session.userId,
       firstQ.questionId,
       sessionId,
       correlationId,
-    );
+    ).catch(() => {});
   }
-
-  await saveConversationTurn(
+  saveConversationTurn(
     sessionId,
     session.userId,
     {
@@ -456,8 +433,8 @@ export async function deliverGreetingAndFirstQuestion(
       timestamp: new Date().toISOString(),
     },
     correlationId,
-  );
-  await saveConversationTurn(
+  ).catch(() => {});
+  saveConversationTurn(
     sessionId,
     session.userId,
     {
@@ -467,7 +444,7 @@ export async function deliverGreetingAndFirstQuestion(
       questionId: firstQ.questionId,
     },
     correlationId,
-  );
+  ).catch(() => {});
 
   return new Response(
     buildVoiceXML([
@@ -488,27 +465,21 @@ export async function deliverGreetingAndFirstQuestion(
   );
 }
 
-// ─── Session wrap-up ──────────────────────────────────────────────────────────
+// ─── Wrap-up ──────────────────────────────────────────────────────────────────
 
 function buildWrapUp(session: InboundSession): AIDecision {
   const name = session.userProfile?.name?.split(" ")[0] || "there";
-  const globalCount = session.globalQuestionsAsked.length;
-  const remaining = ENV.MIN_QUESTIONS_FOR_MODEL - globalCount;
-
-  let closingLine: string;
-  if (remaining <= 0) {
-    closingLine =
-      "I believe we now have a beautifully complete picture of your thinking and wisdom.";
-  } else if (remaining <= ENV.QUESTIONS_PER_SESSION) {
-    closingLine =
-      "We're very close — just one more session like this should do it.";
-  } else {
-    closingLine =
-      "We're building something meaningful here, one conversation at a time.";
-  }
+  const remaining =
+    ENV.MIN_QUESTIONS_FOR_MODEL - session.globalQuestionsAsked.length;
+  let closingLine =
+    remaining <= 0
+      ? "I believe we now have a beautifully complete picture of your wisdom."
+      : remaining <= ENV.QUESTIONS_PER_SESSION
+        ? "We're very close — just one more session should do it."
+        : "We're building something meaningful here, one conversation at a time.";
 
   return {
-    speech: `Thank you so much, ${name}. We've covered a great deal of important ground today. ${closingLine} Everything you've shared is being preserved with great care. Whenever you're ready for our next conversation, we'll pick up right where we left off. Take good care of yourself.`,
+    speech: `Thank you so much, ${name}. We've covered a great deal today. ${closingLine} Everything you've shared is being preserved with care. Whenever you're ready for our next conversation, we'll pick up right where we left off. Take good care of yourself.`,
     action: "end_session",
   };
 }
@@ -537,10 +508,16 @@ async function getUserSessionCount(
   }
 }
 
-function errorXml(message: string): Response {
+function errorResponse(): Response {
   return new Response(
     buildVoiceXML([
-      { say: { text: message, voice: "woman", playBeep: false } },
+      {
+        say: {
+          text: "I had a brief technical issue. Could you say that again?",
+          voice: "woman",
+          playBeep: false,
+        },
+      },
     ]),
     { status: 200, headers: { "Content-Type": "text/xml" } },
   );

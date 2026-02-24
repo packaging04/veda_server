@@ -11,7 +11,7 @@ import {
 } from "../db/supabase.ts";
 import { buildVoiceXML } from "./voiceXml.ts";
 import { sanitizePhoneNumber } from "../security/helpers.ts";
-import { deliverGreetingAndFirstQuestion } from "./converseHandler.ts";
+import { deliverGreetingAndFirstQuestion } from "./aiThinkingHandler.ts";
 import { transcribeAudio } from "../background/transcription.ts";
 import { AfricasTalkingAction, InboundSession } from "../types/voice.ts";
 
