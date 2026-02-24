@@ -2,10 +2,13 @@
  * Recording Handler
  *
  * Step 1 of the latency bridge:
- * - Receives AT's recording callback
- * - Saves the recording URL into the session store
- * - Returns an instant "thinking" filler + Redirect to /ai_thinking
- * - User hears a natural human pause while the heavy work happens
+ * - Receives AT's recording callback (POST from AT after <Record> finishes)
+ * - Saves recording URL into the session AND into the redirect URL query param
+ * - Returns instant filler phrase + <Redirect> to /ai_thinking
+ *
+ * IMPORTANT: We encode the recordingUrl as a query param in the redirect URL.
+ * This means /ai_thinking does NOT depend on in-memory session state to find
+ * the recording. This fixes the multi-isolate / session-not-found failure.
  */
 
 import { ENV } from "../config/env.ts";
@@ -22,6 +25,14 @@ export async function handleRecordingCallback(
     const formData = await req.formData();
     const url = new URL(req.url);
 
+    // Log ALL form fields AT sends for debugging
+    const fields: Record<string, string> = {};
+    for (const [k, v] of formData.entries()) fields[k] = v.toString();
+    console.log(
+      `📼 [${correlationId}] Recording callback fields:`,
+      JSON.stringify(fields),
+    );
+
     const recordingUrl = formData.get("recordingUrl") as string;
     const durationInSeconds = parseInt(
       (formData.get("durationInSeconds") as string) || "0",
@@ -32,14 +43,34 @@ export async function handleRecordingCallback(
     const turnIndex = parseInt(url.searchParams.get("turnIndex") || "0");
 
     console.log(
-      `📼 [${correlationId}] Recording received — session: ${sessionId}, turn: ${turnIndex}`,
+      `📼 [${correlationId}] Recording — session: ${sessionId}, phase: ${phase}, turn: ${turnIndex}, url present: ${!!recordingUrl}`,
     );
 
-    if (!sessionId || !recordingUrl) {
+    if (!sessionId) {
+      console.error(`❌ [${correlationId}] No sessionId in recording callback`);
       return naturalErrorResponse();
     }
 
-    // Idempotency
+    if (!recordingUrl) {
+      console.error(
+        `❌ [${correlationId}] No recordingUrl in recording callback — AT may not have sent it yet`,
+      );
+      // Return a brief hold message so the call doesn't drop
+      return new Response(
+        buildVoiceXML([
+          {
+            say: {
+              text: "One moment please.",
+              voice: "woman",
+              playBeep: false,
+            },
+          },
+        ]),
+        { status: 200, headers: { "Content-Type": "text/xml" } },
+      );
+    }
+
+    // Idempotency check
     const recordingKey = `rec-${sessionId}-${turnIndex}-${phase}`;
     if (recordingProcessed.has(recordingKey)) {
       console.log(`⚠️  [${correlationId}] Duplicate recording ignored`);
@@ -51,46 +82,52 @@ export async function handleRecordingCallback(
     recordingProcessed.add(recordingKey);
     setTimeout(() => recordingProcessed.delete(recordingKey), 10 * 60 * 1000);
 
-    // SSRF protection
+    // SSRF protection — log the URL for debugging before validating
+    console.log(`📼 [${correlationId}] Recording URL: ${recordingUrl}`);
     if (!validateRecordingUrl(recordingUrl)) {
-      console.error(`❌ [${correlationId}] SSRF blocked: ${recordingUrl}`);
+      console.error(
+        `❌ [${correlationId}] SSRF blocked: ${recordingUrl} — not from africastalking.com`,
+      );
       return naturalErrorResponse();
     }
 
+    // Save into in-memory session (best-effort — redirect URL is the reliable path)
     const session = activeSessions.get(sessionId);
-    if (!session) {
-      console.error(`❌ [${correlationId}] Session not found: ${sessionId}`);
-      return naturalErrorResponse();
+    if (session) {
+      session.pendingRecordingUrl = recordingUrl;
+      session.pendingTurnIndex = turnIndex;
+      session.pendingQuestionId = questionId;
+      session.lastActivity = new Date().toISOString();
+      activeSessions.set(sessionId, session);
+    } else {
+      console.warn(
+        `⚠️  [${correlationId}] Session not in memory (${sessionId}) — using redirect URL as primary`,
+      );
     }
 
-    // ── SAVE recording URL into session for /ai_thinking to pick up ──────────
-    session.pendingRecordingUrl = recordingUrl;
-    session.pendingTurnIndex = turnIndex;
-    session.pendingQuestionId = questionId;
-    session.lastActivity = new Date().toISOString();
-    activeSessions.set(sessionId, session);
-
-    // ── Pick a filler phrase (rotated to feel natural) ────────────────────────
+    // Filler phrase (rotated)
     const fillerIndex = turnIndex % ENV.THINKING_FILLERS.length;
     const filler = ENV.THINKING_FILLERS[fillerIndex];
 
-    // ── Respond INSTANTLY with filler + redirect ──────────────────────────────
-    // The user hears the filler while /ai_thinking does Whisper + Claude
-    const redirectUrl = `${ENV.BASE_URL}/ai_thinking?sessionId=${sessionId}&phase=${phase}&durationSeconds=${durationInSeconds}`;
+    // ── KEY FIX: encode recordingUrl INTO the redirect URL ─────────────────────
+    // /ai_thinking will read it from query params as a reliable fallback
+    const redirectUrl =
+      `${ENV.BASE_URL}/ai_thinking` +
+      `?sessionId=${encodeURIComponent(sessionId)}` +
+      `&phase=${encodeURIComponent(phase)}` +
+      `&durationSeconds=${durationInSeconds}` +
+      `&recordingUrl=${encodeURIComponent(recordingUrl)}` +
+      `&questionId=${encodeURIComponent(questionId)}` +
+      `&turnIndex=${turnIndex}`;
 
     const actions: AfricasTalkingAction[] = [
-      {
-        say: {
-          text: filler,
-          voice: "woman",
-          playBeep: false,
-        },
-      },
-      {
-        redirect: { url: redirectUrl },
-      },
+      { say: { text: filler, voice: "woman", playBeep: false } },
+      { redirect: { url: redirectUrl } },
     ];
 
+    console.log(
+      `📼 [${correlationId}] Returning filler + redirect to ai_thinking`,
+    );
     return new Response(buildVoiceXML(actions), {
       status: 200,
       headers: { "Content-Type": "text/xml" },

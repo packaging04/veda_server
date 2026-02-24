@@ -230,6 +230,122 @@ export const QUESTION_BANK: BankQuestion[] = [
     category: "legacy",
     userTypes: ["alzheimer_patient"],
   },
+
+  // ─── GENERAL (applies to any user type) ────────────────────────────────────
+  {
+    id: "gen-001",
+    text: "When you look back on the decisions that have shaped your life most, what kinds of things tend to carry the most weight in how you make them?",
+    category: "decision_making",
+    userTypes: ["general"],
+    followUpPrompts: [
+      "Ask for a concrete example from their life",
+      "Explore whether this approach changed over time",
+    ],
+  },
+  {
+    id: "gen-002",
+    text: "Is there a lesson you had to learn the hard way — something that only really made sense after you lived it?",
+    category: "wisdom",
+    userTypes: ["general"],
+    followUpPrompts: [
+      "What were the circumstances that taught it?",
+      "How has it changed how you approach things now?",
+    ],
+  },
+  {
+    id: "gen-003",
+    text: "What do you think people often misunderstand about success — or about what really makes a good life?",
+    category: "values",
+    userTypes: ["general"],
+  },
+  {
+    id: "gen-004",
+    text: "Who in your life has had the deepest influence on the kind of person you've become?",
+    category: "relationships",
+    userTypes: ["general"],
+    followUpPrompts: [
+      "What specifically did they pass on to you?",
+      "Did they know the impact they had?",
+    ],
+  },
+  {
+    id: "gen-005",
+    text: "If the people closest to you had to describe what you stand for — your core values — what would they say?",
+    category: "identity",
+    userTypes: ["general"],
+  },
+  {
+    id: "gen-006",
+    text: "What's something you believe deeply that many people around you don't seem to share?",
+    category: "worldview",
+    userTypes: ["general"],
+    followUpPrompts: [
+      "Where does that belief come from?",
+      "Has it ever cost you something to hold it?",
+    ],
+  },
+  {
+    id: "gen-007",
+    text: "Looking back across your life, which period or chapter taught you the most — and why do you think that is?",
+    category: "life_journey",
+    userTypes: ["general"],
+  },
+  {
+    id: "gen-008",
+    text: "What would you want the next generation to understand about navigating the world well?",
+    category: "legacy",
+    userTypes: ["general"],
+    followUpPrompts: [
+      "What's the most important thing they seem to be missing?",
+      "What's something you wish you'd been told earlier?",
+    ],
+  },
+  {
+    id: "gen-009",
+    text: "What does resilience look like for you personally — how do you come back from setbacks?",
+    category: "resilience",
+    userTypes: ["general"],
+  },
+  {
+    id: "gen-010",
+    text: "When you're at your best — when things are really flowing — what does that look like, and what conditions tend to make it possible?",
+    category: "self_knowledge",
+    userTypes: ["general"],
+  },
+  {
+    id: "gen-011",
+    text: "Is there a time you had to choose between what was expected of you and what you genuinely believed was right? What did you do?",
+    category: "integrity",
+    userTypes: ["general"],
+  },
+  {
+    id: "gen-012",
+    text: "What do you think about most when you have quiet time — the things you still want to understand or do or be?",
+    category: "aspirations",
+    userTypes: ["general"],
+  },
+  {
+    id: "gen-013",
+    text: "What's a belief or assumption you held for a long time that you eventually had to let go of?",
+    category: "growth",
+    userTypes: ["general"],
+    followUpPrompts: [
+      "What changed your mind?",
+      "What did it feel like to let it go?",
+    ],
+  },
+  {
+    id: "gen-014",
+    text: "How do you think about the relationship between work and the rest of life — has that balance shifted over time?",
+    category: "life_philosophy",
+    userTypes: ["general"],
+  },
+  {
+    id: "gen-015",
+    text: "What would you want people to remember about you — not as an achievement, but as a presence in their lives?",
+    category: "legacy",
+    userTypes: ["general"],
+  },
 ];
 
 export function getQuestionsForUser(userType: string): BankQuestion[] {

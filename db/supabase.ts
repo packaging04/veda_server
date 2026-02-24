@@ -29,6 +29,32 @@ function phonesMatch(a: string, b: string): boolean {
   return lastDigits(a) === lastDigits(b);
 }
 
+/**
+ * Fetch first_name/last_name from auth.users metadata as fallback.
+ * Used when profiles.first_name is empty (can happen if upsert failed due to RLS).
+ */
+async function fetchAuthUserName(
+  userId: string,
+): Promise<{ first_name?: string; last_name?: string }> {
+  try {
+    const resp = await fetch(
+      `${ENV.SUPABASE_URL}/auth/v1/admin/users/${userId}`,
+      {
+        headers: {
+          apikey: ENV.SUPABASE_SERVICE_KEY,
+          Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
+        },
+      },
+    );
+    if (!resp.ok) return {};
+    const user = await resp.json();
+    const meta = user.user_metadata || user.raw_user_meta_data || {};
+    return { first_name: meta.first_name, last_name: meta.last_name };
+  } catch {
+    return {};
+  }
+}
+
 // ─── USER IDENTIFICATION ──────────────────────────────────────────────────────
 
 /**
@@ -116,7 +142,10 @@ export async function lookupUserByPhone(
       console.log(`  → user ${win.user_id}: profile.phone=${profile.phone}`);
 
       if (phonesMatch(phoneNumber, profile.phone)) {
-        const userProfile = mapProfileToUserProfile(profile, win.call_code);
+        const userProfile = await mapProfileToUserProfile(
+          profile,
+          win.call_code,
+        );
         userProfile.totalQuestionsAsked = await getTotalQuestionsAsked(
           userProfile.userId,
           correlationId,
@@ -202,7 +231,7 @@ export async function lookupUserByCode(
       const profile = await fetchProfileById(rows[0].user_id, correlationId);
       if (!profile) continue;
 
-      const userProfile = mapProfileToUserProfile(profile, code);
+      const userProfile = await mapProfileToUserProfile(profile, code);
       userProfile.totalQuestionsAsked = await getTotalQuestionsAsked(
         userProfile.userId,
         correlationId,
@@ -224,7 +253,10 @@ export async function lookupUserByCode(
   }
 }
 
-function mapProfileToUserProfile(profile: any, callCode: string): UserProfile {
+async function mapProfileToUserProfile(
+  profile: any,
+  callCode: string,
+): Promise<UserProfile> {
   const typeMap: Record<string, UserProfile["userType"]> = {
     ceo: "ceo_founder",
     founder: "ceo_founder",
@@ -241,9 +273,17 @@ function mapProfileToUserProfile(profile: any, callCode: string): UserProfile {
   const rawType = (profile.user_type || "").toLowerCase();
   const userType: UserProfile["userType"] = typeMap[rawType] || "general";
 
-  const firstName = profile.first_name || "";
-  const lastName = profile.last_name || "";
-  const name = [firstName, lastName].filter(Boolean).join(" ") || "Friend";
+  let firstName = profile.first_name || "";
+  let lastName = profile.last_name || "";
+
+  // If names are empty, try auth.users metadata as fallback
+  if (!firstName && !lastName && profile.id) {
+    const meta = await fetchAuthUserName(profile.id);
+    firstName = meta.first_name || "";
+    lastName = meta.last_name || "";
+  }
+
+  const name = [firstName, lastName].filter(Boolean).join(" ") || "there";
 
   return {
     userId: profile.id,
