@@ -9,9 +9,8 @@ import {
 } from "../db/supabase.ts";
 import { buildVoiceXML } from "./voiceXml.ts";
 import { sanitizePhoneNumber } from "../security/helpers.ts";
-import { deliverGreetingAndFirstQuestion } from "./conversationHandler.ts";
-
 import { AfricasTalkingAction, InboundSession } from "../types/voice.ts";
+import { deliverGreetingAndFirstQuestion } from "./Conversationhandler.ts";
 
 export async function handleVoiceCallback(
   req: Request,
