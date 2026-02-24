@@ -6,11 +6,14 @@ import {
   updateInboundSessionStatus,
   logEvent,
   getUserQuestionProgress,
+  saveConversationTurn,
+  saveRecording,
 } from "../db/supabase.ts";
 import { buildVoiceXML } from "./voiceXml.ts";
 import { sanitizePhoneNumber } from "../security/helpers.ts";
+import { deliverGreetingAndFirstQuestion } from "./conversationHandler.ts";
+import { transcribeAudio } from "../background/transcription.ts";
 import { AfricasTalkingAction, InboundSession } from "../types/voice.ts";
-import { deliverGreetingAndFirstQuestion } from "./converseHandler.ts";
 
 export async function handleVoiceCallback(
   req: Request,
@@ -18,9 +21,11 @@ export async function handleVoiceCallback(
 ): Promise<Response> {
   try {
     const formData = await req.formData();
-    const url = new URL(req.url);
 
-    console.log(`📞 [${correlationId}] Inbound call`);
+    // Log all fields AT sends — critical for debugging
+    const fields: Record<string, string> = {};
+    for (const [k, v] of formData.entries()) fields[k] = v.toString();
+    console.log(`📞 [${correlationId}] /voice fields:`, JSON.stringify(fields));
 
     const sessionId = formData.get("sessionId") as string;
     const isActive = formData.get("isActive") as string;
@@ -30,9 +35,21 @@ export async function handleVoiceCallback(
 
     if (!sessionId) return errorResponse("Session error");
 
-    // ── Call ended ────────────────────────────────────────────────────────────
+    // ── Call ended (isActive=0) ───────────────────────────────────────────────
+    // AT sends this when the call completes. It includes recordingUrl if the
+    // user was recording when they hung up. We save + process it here so no
+    // response is ever lost, even if /recording callback was never triggered.
     if (isActive === "0") {
+      const recordingUrl = formData.get("recordingUrl") as string | null;
+      const durationInSeconds = parseInt(
+        (formData.get("durationInSeconds") as string) || "0",
+      );
       const session = activeSessions.get(sessionId);
+
+      console.log(
+        `📞 [${correlationId}] Call ended. duration=${durationInSeconds}s, recordingUrl=${recordingUrl ? "PRESENT" : "none"}`,
+      );
+
       if (session) {
         await updateInboundSessionStatus(
           sessionId,
@@ -44,18 +61,61 @@ export async function handleVoiceCallback(
           sessionId,
           "call_ended",
           {
+            duration_seconds: durationInSeconds,
             turns: session.conversationHistory.length,
             session_questions: session.sessionQuestionsAsked.length,
             global_questions: session.globalQuestionsAsked.length,
+            had_recording: !!recordingUrl,
           },
           correlationId,
         );
+
+        // ── Save + transcribe recording from completion event (background) ──
+        // This catches responses that arrived ONLY in the completion event,
+        // e.g. user hung up before the 3s silence timeout fired.
+        if (recordingUrl && session.currentQuestionId) {
+          processCallCompletionRecording(
+            recordingUrl,
+            durationInSeconds,
+            session,
+            sessionId,
+            correlationId,
+          ).catch((e) =>
+            console.error(
+              `❌ [${correlationId}] Completion recording error:`,
+              e,
+            ),
+          );
+        }
+
         activeSessions.delete(sessionId);
+      } else {
+        // Session not in memory (e.g. isolate restart) — still log it
+        console.warn(
+          `⚠️  [${correlationId}] Session ${sessionId} not in memory at call end`,
+        );
+        if (recordingUrl) {
+          console.log(
+            `📼 [${correlationId}] Recording URL (no session): ${recordingUrl}`,
+          );
+          // Save a minimal record so we don't lose it
+          await logEvent(
+            sessionId,
+            "orphaned_recording",
+            {
+              recording_url: recordingUrl,
+              duration_seconds: durationInSeconds,
+              caller: callerNumber,
+            },
+            correlationId,
+          );
+        }
       }
+
       return new Response("", { status: 200 });
     }
 
-    // ── Idempotency ───────────────────────────────────────────────────────────
+    // ── Idempotency (active call) ─────────────────────────────────────────────
     const idempotencyKey = `voice-${sessionId}-${isActive}`;
     if (processedCallbacks.has(idempotencyKey)) {
       return new Response(buildVoiceXML([]), {
@@ -74,7 +134,6 @@ export async function handleVoiceCallback(
         ? await lookupUserByPhone(callerNumber, correlationId)
         : null;
 
-      // Load global question history if we identified the user
       const globalQuestionsAsked = profileByPhone
         ? await getUserQuestionProgress(profileByPhone.userId, correlationId)
         : [];
@@ -101,12 +160,10 @@ export async function handleVoiceCallback(
       activeSessions.set(sessionId, session);
 
       if (profileByPhone) {
-        // Get session count for this user
         const sessionNumber = await getUserSessionCount(
           profileByPhone.userId,
           correlationId,
         );
-
         await createInboundSession(
           sessionId,
           profileByPhone.userId,
@@ -130,9 +187,7 @@ export async function handleVoiceCallback(
         await logEvent(
           sessionId,
           "call_started_unknown",
-          {
-            caller_phone: callerNumber,
-          },
+          { caller_phone: callerNumber },
           correlationId,
         );
       }
@@ -147,9 +202,18 @@ export async function handleVoiceCallback(
     }
 
     if (session.phase === "greeting") {
-      return await handleGreetingPhase(session, sessionId, correlationId);
+      return await deliverGreetingAndFirstQuestion(
+        session,
+        sessionId,
+        correlationId,
+      );
     }
 
+    // Already in conversation — AT called /voice again unexpectedly
+    // Just return empty to keep the call alive
+    console.warn(
+      `⚠️  [${correlationId}] Unexpected /voice call in phase: ${session.phase}`,
+    );
     return new Response(buildVoiceXML([]), {
       status: 200,
       headers: { "Content-Type": "text/xml" },
@@ -160,25 +224,109 @@ export async function handleVoiceCallback(
   }
 }
 
+// ─── Process recording that arrived in call completion event ──────────────────
+// Runs in background after we've already responded to AT (non-blocking)
+
+async function processCallCompletionRecording(
+  recordingUrl: string,
+  durationSeconds: number,
+  session: InboundSession,
+  sessionId: string,
+  correlationId: string,
+): Promise<void> {
+  console.log(
+    `📼 [${correlationId}] Processing completion recording for session ${sessionId}`,
+  );
+
+  try {
+    // Download the audio
+    const controller = new AbortController();
+    const timeoutId = setTimeout(
+      () => controller.abort(),
+      ENV.FETCH_TIMEOUT_MS,
+    );
+    const audioResp = await fetch(recordingUrl, { signal: controller.signal });
+    clearTimeout(timeoutId);
+
+    if (!audioResp.ok) {
+      console.error(
+        `❌ [${correlationId}] Completion recording download failed: ${audioResp.status}`,
+      );
+      return;
+    }
+
+    const audioBuffer = await audioResp.arrayBuffer();
+    console.log(
+      `✅ [${correlationId}] Completion recording downloaded: ${(audioBuffer.byteLength / 1024).toFixed(1)}KB`,
+    );
+
+    // Transcribe
+    const transcript = await transcribeAudio(audioBuffer, correlationId);
+    console.log(
+      `📝 [${correlationId}] Completion transcript: "${transcript.substring(0, 100)}"`,
+    );
+
+    if (!transcript.trim()) return;
+
+    const questionId = session.currentQuestionId || "unknown";
+
+    // Save conversation turn
+    await saveConversationTurn(
+      sessionId,
+      session.userId,
+      {
+        role: "user",
+        content: transcript,
+        timestamp: new Date().toISOString(),
+        questionId,
+        audioUrl: recordingUrl,
+      },
+      correlationId,
+    );
+
+    // Save recording record
+    await saveRecording(
+      sessionId,
+      session.userId,
+      questionId,
+      `Question ${session.sessionQuestionsAsked.length}`,
+      session.sessionQuestionsAsked.length,
+      recordingUrl,
+      "",
+      durationSeconds,
+      audioBuffer.byteLength,
+      correlationId,
+    );
+
+    console.log(
+      `✅ [${correlationId}] Completion recording saved for session ${sessionId}`,
+    );
+  } catch (err) {
+    console.error(
+      `❌ [${correlationId}] processCallCompletionRecording error:`,
+      err,
+    );
+  }
+}
+
+// ─── Identification phase (ask for code) ─────────────────────────────────────
+
 function handleIdentificationPhase(
   session: InboundSession,
   sessionId: string,
 ): Response {
-  const isReturning = false; // could detect based on known phone
-
   const actions: AfricasTalkingAction[] = [
     {
       say: {
-        text: "Hello, and welcome to Veda. I'm so glad you called. To get started, could you please say your personal access code? You would have received it when you registered. Please say it clearly after the beep.",
+        text: "Hello, and welcome to Veda. I'm so glad you called. To get started, please say your 6-character access code slowly and clearly, then press the hash key.",
         voice: "woman",
         playBeep: false,
       },
     },
-    { pause: { length: 1 } },
     {
       record: {
-        maxLength: 15,
-        timeout: 8,
+        maxLength: 20,
+        timeout: 5,
         finishOnKey: "#",
         trimSilence: true,
         playBeep: true,
@@ -193,18 +341,7 @@ function handleIdentificationPhase(
   });
 }
 
-async function handleGreetingPhase(
-  session: InboundSession,
-  sessionId: string,
-  correlationId: string,
-): Promise<Response> {
-  // Delegate to conversationHandler which handles greeting + first question + Record
-  return await deliverGreetingAndFirstQuestion(
-    session,
-    sessionId,
-    correlationId,
-  );
-}
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 async function getUserSessionCount(
   userId: string,

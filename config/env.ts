@@ -7,7 +7,13 @@ export const ENV = {
   AT_USERNAME: Deno.env.get("AT_USERNAME") || "",
   AT_API_KEY: Deno.env.get("AT_API_KEY") || "",
   AT_CALLER_ID: Deno.env.get("AT_CALLER_ID") || "",
-  AT_ALLOWED_DOMAINS: ["africastalking.com", "voice.africastalking.com"],
+  // AT recording URLs come from at-internal.com subdomains, NOT africastalking.com
+  // e.g. https://gigantic.keller-shockley.at-internal.com/xxxx.mp3
+  AT_ALLOWED_DOMAINS: [
+    "africastalking.com",
+    "voice.africastalking.com",
+    "at-internal.com",
+  ],
 
   // Recording
   MAX_RECORDING_SIZE_MB: 50,

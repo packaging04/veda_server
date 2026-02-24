@@ -481,13 +481,28 @@ export async function saveRecording(
   questionText: string,
   questionOrder: number,
   recordingUrl: string,
-  storagePath: string,
+  _storagePath: string,
   duration: number,
-  fileSize: number,
+  _fileSize: number,
   correlationId: string,
+  transcript?: string,
 ): Promise<void> {
   try {
-    await fetch(`${ENV.SUPABASE_URL}/rest/v1/call_recordings`, {
+    const body: Record<string, unknown> = {
+      user_id: userId,
+      session_id: sessionId,
+      session_title: `Turn ${questionOrder + 1}: ${questionText.substring(0, 50)}`,
+      call_code: questionId,
+      question_id: questionId,
+      duration_seconds: duration,
+      recording_url: recordingUrl,
+      created_at: new Date().toISOString(),
+    };
+    if (transcript) {
+      body.transcript = transcript;
+      body.transcription_status = "completed";
+    }
+    const resp = await fetch(`${ENV.SUPABASE_URL}/rest/v1/call_recordings`, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
@@ -495,19 +510,17 @@ export async function saveRecording(
         apikey: ENV.SUPABASE_SERVICE_KEY,
         Prefer: "return=minimal",
       },
-      body: JSON.stringify({
-        user_id: userId,
-        session_title: `Turn ${questionOrder + 1}: ${questionText.substring(0, 50)}`,
-        call_code: questionId,
-        duration_seconds: duration,
-        created_at: new Date().toISOString(),
-      }),
+      body: JSON.stringify(body),
     });
+    if (!resp.ok) {
+      console.error(
+        `❌ [${correlationId}] saveRecording HTTP error: ${await resp.text()}`,
+      );
+    }
   } catch (error) {
     console.error(`❌ [${correlationId}] Save recording error:`, error);
   }
 }
-
 // ─── EVENT LOGGING ────────────────────────────────────────────────────────────
 
 export async function logEvent(

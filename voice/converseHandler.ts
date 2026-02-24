@@ -23,9 +23,9 @@ import {
   createInboundSession,
   lookupUserByCode,
   logEvent,
+  saveRecording,
 } from "../db/supabase.ts";
 import { buildVoiceXML } from "./voiceXml.ts";
-import { uploadToSupabase } from "../background/uploader.ts";
 import { transcribeAudio } from "../background/transcription.ts";
 import {
   getAIDecision,
@@ -127,21 +127,7 @@ export async function handleRecordingCallback(
       );
     }
 
-    // ── Background upload (fire and forget) ───────────────────────────────────
-    if (session.userId && audioBuffer.byteLength > 500) {
-      const storagePath = `inbound/${session.userId}/${sessionId}/turn-${turnIndex}-${Date.now()}.mp3`;
-      uploadToSupabase(
-        audioBuffer,
-        storagePath,
-        sessionId,
-        session.userId,
-        questionId,
-        `Turn ${turnIndex + 1}`,
-        turnIndex,
-        durationInSeconds,
-        correlationId,
-      ).catch((e) => console.error(`❌ Upload failed:`, e));
-    }
+    // (recording saved after transcription below, so we have transcript too)
 
     // ── Route by phase ─────────────────────────────────────────────────────────
     if (phase === "identification" || phase === "identification_retry") {
@@ -203,6 +189,21 @@ export async function handleRecordingCallback(
       userTurn,
       correlationId,
     );
+
+    // ── Save recording URL + transcript to call_recordings ────────────────────
+    saveRecording(
+      sessionId,
+      session.userId,
+      questionId,
+      `Question turn ${turnIndex + 1}`,
+      turnIndex,
+      recordingUrl,
+      "",
+      durationInSeconds,
+      0,
+      correlationId,
+      transcript,
+    ).catch((e) => console.error(`❌ saveRecording error:`, e));
 
     // ── AI decision ────────────────────────────────────────────────────────────
     const sessionQCount = session.sessionQuestionsAsked.length;
