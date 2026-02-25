@@ -241,8 +241,22 @@ export async function handleAIThinking(
     console.log(`⚡ [${correlationId}] Total processing: ${totalMs}ms`);
 
     const nextTurnIndex = turnIndex + 1;
+
+    // Append hash reminder — this is how the user signals they are done speaking.
+    // Keep it short and consistent so it becomes muscle memory after the first turn.
+    const hashReminder =
+      turnIndex === 0
+        ? " Take as long as you need — and press the hash key when you're finished."
+        : " Press hash when you're done.";
+
     const actions: AfricasTalkingAction[] = [
-      { say: { text: decision.speech, voice: "woman", playBeep: false } },
+      {
+        say: {
+          text: decision.speech + hashReminder,
+          voice: "woman",
+          playBeep: false,
+        },
+      },
     ];
 
     if (decision.action === "end_session") {
@@ -263,10 +277,16 @@ export async function handleAIThinking(
       ).catch(() => {});
       setTimeout(() => activeSessions.delete(sessionId), 30000);
 
-      return new Response(buildVoiceXML(actions), {
-        status: 200,
-        headers: { "Content-Type": "text/xml" },
-      });
+      // No Record on end — just say the goodbye
+      return new Response(
+        buildVoiceXML([
+          { say: { text: decision.speech, voice: "woman", playBeep: false } },
+        ]),
+        {
+          status: 200,
+          headers: { "Content-Type": "text/xml" },
+        },
+      );
     }
 
     const nextQuestionId = decision.questionId ?? questionId;
@@ -449,7 +469,15 @@ export async function deliverGreetingAndFirstQuestion(
   return new Response(
     buildVoiceXML([
       { say: { text: greetingText, voice: "woman", playBeep: false } },
-      { say: { text: firstQ.speech, voice: "woman", playBeep: false } },
+      {
+        say: {
+          text:
+            firstQ.speech +
+            " Take as long as you need — and press the hash key when you're finished.",
+          voice: "woman",
+          playBeep: false,
+        },
+      },
       {
         record: {
           maxLength: ENV.RECORDING_MAX_LENGTH_SECONDS,

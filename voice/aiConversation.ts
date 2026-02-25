@@ -70,20 +70,38 @@ export async function getAIDecisionFast(
   // Compact prompt — fewer tokens = faster response
   const prompt = `${VEDA_SYSTEM_PROMPT}
 
-USER: ${name ? `${name}, ` : ""}${session.userProfile?.userType || "general"} type.
-GLOBAL QUESTIONS ASKED: ${session.globalQuestionsAsked.length}. SESSION: ${session.sessionQuestionsAsked.length}/${ENV.QUESTIONS_PER_SESSION}.
-CONSECUTIVE FOLLOW-UPS: ${session.followUpCount}/${ENV.MAX_FOLLOW_UPS_PER_TOPIC}.
+CONTEXT:
+- Person: ${name || "unknown"}, type: ${session.userProfile?.userType || "general"}
+- Session questions asked: ${session.sessionQuestionsAsked.length}/${ENV.QUESTIONS_PER_SESSION}
+- Consecutive follow-ups on this topic: ${session.followUpCount}/${ENV.MAX_FOLLOW_UPS_PER_TOPIC}
 
 RECENT CONVERSATION:
 ${conversationText}
 
 PERSON JUST SAID: "${latestUserInput}"
 
-AVAILABLE QUESTIONS:
-${availableQText || "None — use end_session."}
+AVAILABLE NEXT QUESTIONS:
+${availableQText || "None remaining — use end_session."}
 
-Respond ONLY with valid JSON (no markdown):
-{"speech":"...","action":"ask_question"|"follow_up"|"end_session","questionId":"id-if-asking","reasoning":"brief"}`;
+DECISION RULES — read carefully:
+1. FOLLOW-UP if any of these are true:
+   - Answer is vague, generic, or less than 2 substantive sentences
+   - Answer touches on something emotionally significant but doesn't explain WHY
+   - Answer gives a conclusion but skips the reasoning behind it
+   - Answer mentions a specific person, event, or turning point without elaborating
+   Your follow-up must quote or reference something SPECIFIC the person just said.
+   Bad follow-up: "Could you tell me more about that?"
+   Good follow-up: "You mentioned [specific thing they said] — what was it about that situation that shaped how you think about [topic]?"
+
+2. ASK_QUESTION if:
+   - Answer is clear, substantive, and reveals genuine reasoning or values
+   - You've already done ${ENV.MAX_FOLLOW_UPS_PER_TOPIC} follow-ups on this topic
+   Pick the most thematically relevant question from the available list.
+
+3. END_SESSION only if no questions remain.
+
+Respond ONLY with valid JSON (no markdown, no explanation):
+{"speech":"...","action":"ask_question"|"follow_up"|"end_session","questionId":"id-only-if-ask_question","reasoning":"one sentence why"}`;
 
   try {
     const response = await fetch("https://api.anthropic.com/v1/messages", {

@@ -19,7 +19,7 @@ export const ENV = {
   MAX_RECORDING_SIZE_MB: 50,
   FETCH_TIMEOUT_MS: 30000,
   RECORDING_MAX_LENGTH_SECONDS: 300,
-  RECORDING_TIMEOUT_SECONDS: 3, // 3s silence = faster response, better UX
+  RECORDING_TIMEOUT_SECONDS: 120, // # key is primary trigger — silence is safety net only
 
   // Session
   SESSION_STALE_THRESHOLD_MS: 45 * 60 * 1000,
@@ -27,15 +27,16 @@ export const ENV = {
   // Multi-session question pacing
   QUESTIONS_PER_SESSION: 4,
   MIN_QUESTIONS_FOR_MODEL: 15,
-  MAX_FOLLOW_UPS_PER_TOPIC: 2,
+  MAX_FOLLOW_UPS_PER_TOPIC: 3, // 3 gives Veda room to genuinely drill down
 
-  // Latency filler phrases
+  // Latency filler phrases — play while /ai_thinking processes
+  // These fire after user presses #, so they should sound like genuine reflection
   THINKING_FILLERS: [
-    "Hmm, give me just a moment to reflect on that.",
-    "I see. Let me take a moment with that.",
-    "That's really interesting. One moment.",
-    "Yes, I want to make sure I'm hearing you properly. Just a moment.",
-    "Mmm. Let me sit with that for a second.",
+    "Mmm. Let me sit with that for a moment.",
+    "That's really interesting. Give me just a second.",
+    "I want to make sure I'm hearing you properly. One moment.",
+    "Hmm. Let me reflect on what you've shared.",
+    "Thank you for that. Just a moment while I think.",
   ],
 };
 
