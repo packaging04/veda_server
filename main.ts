@@ -14,7 +14,7 @@ Deno.serve(async (req: Request) => {
     return Response.json({
       status: "running",
       service: "Veda Inbound AI Voice Server",
-      version: "4.0.1",
+      version: "4.0.2",
       active_sessions: activeSessions.size,
     });
   }
