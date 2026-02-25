@@ -315,22 +315,18 @@ function handleIdentificationPhase(
   session: InboundSession,
   sessionId: string,
 ): Response {
+  // Use <GetDigits> NOT <Record> — DTMF keypad input is instant and reliable.
+  // No audio file, no Whisper transcription, no 15s timeout risk.
+  // User types their 6-digit PIN → AT sends dtmfDigits to /code immediately.
   const actions: AfricasTalkingAction[] = [
     {
-      say: {
-        text: "Hello, and welcome to Veda. I'm so glad you called. To get started, please say your 6-character access code slowly and clearly, then press the hash key.",
-        voice: "woman",
-        playBeep: false,
-      },
-    },
-    {
-      record: {
-        maxLength: 20,
-        timeout: 5,
+      getDigits: {
+        timeout: 15,
+        numDigits: 6,
         finishOnKey: "#",
-        trimSilence: true,
-        playBeep: true,
-        callbackUrl: `${ENV.BASE_URL}/recording?sessionId=${sessionId}&phase=identification`,
+        callbackUrl: `${ENV.BASE_URL}/code?sessionId=${sessionId}`,
+        promptText:
+          "Hello, and welcome to Veda. I'm so glad you called. To get started, please enter your 6-digit PIN on your keypad, then press hash. You'll find your PIN in the Veda app.",
       },
     },
   ];

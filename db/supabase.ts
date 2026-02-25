@@ -188,22 +188,22 @@ export async function lookupUserByCode(
     // Build candidate codes to try in order
     const candidates: string[] = [];
 
-    // 1. Exact as-spoken (normalised)
-    candidates.push(clean);
+    // 1. Numeric-only (primary) — GetDigits sends "382947", strip any noise
+    const numericOnly = rawCode.replace(/\D/g, "");
+    if (numericOnly.length >= 4) candidates.push(numericOnly);
 
-    // 2. Stripped (no dashes) — for 6-char codes
-    if (stripped !== clean) candidates.push(stripped);
+    // 2. Alphanumeric exact (normalised) — legacy spoken codes
+    if (clean && clean !== numericOnly) candidates.push(clean);
 
-    // 3. Legacy VDA-XXX-XXX: if user said "VDA ABC 123" → "VDAABC123" → "VDA-ABC-123"
+    // 3. No-dashes version
+    if (stripped && stripped !== clean && stripped !== numericOnly)
+      candidates.push(stripped);
+
+    // 4. Legacy VDA-XXX-XXX format
     if (stripped.length === 9) {
       candidates.push(
         `${stripped.slice(0, 3)}-${stripped.slice(3, 6)}-${stripped.slice(6)}`,
       );
-    }
-
-    // 4. If only 6 chars, try wrapping in VDA- prefix (old format users)
-    if (stripped.length === 6) {
-      candidates.push(`VDA-${stripped.slice(0, 3)}-${stripped.slice(3)}`);
     }
 
     for (const code of [...new Set(candidates)]) {

@@ -2,6 +2,7 @@ import { ENV } from "./config/env.ts";
 import { handleVoiceCallback } from "./voice/voiceHandler.ts";
 import { handleRecordingCallback } from "./voice/recordingHandler.ts";
 import { handleAIThinking } from "./voice/aiThinkingHandler.ts";
+import { handleCodeCallback } from "./voice/codeHandler.ts";
 import { activeSessions } from "./voice/sessionStore.ts";
 
 Deno.serve(async (req: Request) => {
@@ -13,7 +14,7 @@ Deno.serve(async (req: Request) => {
     return Response.json({
       status: "running",
       service: "Veda Inbound AI Voice Server",
-      version: "4.0.0",
+      version: "4.0.1",
       active_sessions: activeSessions.size,
     });
   }
@@ -44,6 +45,12 @@ Deno.serve(async (req: Request) => {
     return handleRecordingCallback(req, correlationId);
   }
 
+  // POST /code — AT sends DTMF digits here after <GetDigits> finishes
+  // Instant PIN lookup — no audio, no Whisper, responds in < 500ms
+  if (req.method === "POST" && url.pathname === "/code") {
+    return handleCodeCallback(req, correlationId);
+  }
+
   // GET or POST /ai_thinking — AT follows the <Redirect> here
   // AT uses POST when following a <Redirect>, but accept GET too for safety
   if (
@@ -64,7 +71,5 @@ Deno.serve(async (req: Request) => {
   );
 });
 
-console.log("🚀 Veda Inbound AI Voice Server v4.0");
-console.log(
-  "📞 Architecture: POST /voice → POST /recording (instant) → GET|POST /ai_thinking (Haiku)",
-);
+console.log("🚀 Veda Inbound AI Voice Server v4.1 — GetDigits PIN auth");
+console.log("📞 Auth: POST /voice → GetDigits → POST /code (DTMF, instant)");

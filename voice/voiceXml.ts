@@ -55,6 +55,23 @@ export function buildVoiceXML(actions: AfricasTalkingAction[]): string {
     if (action.redirect) {
       xml += `  <Redirect>${escapeXml(action.redirect.url)}</Redirect>\n`;
     }
+
+    // GetDigits — collects DTMF keypad input
+    // AT requires the <Say> prompt to be NESTED inside <GetDigits>
+    if (action.getDigits) {
+      xml += `  <GetDigits`;
+      xml += ` timeout="${action.getDigits.timeout}"`;
+      if (action.getDigits.numDigits !== undefined) {
+        xml += ` numDigits="${action.getDigits.numDigits}"`;
+      }
+      if (action.getDigits.finishOnKey) {
+        xml += ` finishOnKey="${escapeXml(action.getDigits.finishOnKey)}"`;
+      }
+      xml += ` callbackUrl="${escapeXml(action.getDigits.callbackUrl)}"`;
+      xml += `>\n`;
+      xml += `    <Say voice="woman">${escapeXml(action.getDigits.promptText)}</Say>\n`;
+      xml += `  </GetDigits>\n`;
+    }
   }
 
   xml += `</Response>`;

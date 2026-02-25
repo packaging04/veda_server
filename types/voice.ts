@@ -47,7 +47,6 @@ export interface InboundSession {
     | "complete";
   conversationHistory: ConversationTurn[];
 
-
   // Question tracking — two levels
   sessionQuestionsAsked: string[]; // question IDs asked THIS session only
   globalQuestionsAsked: string[]; // question IDs asked across ALL sessions (loaded from DB)
@@ -92,6 +91,15 @@ export interface AfricasTalkingAction {
   };
   redirect?: {
     url: string;
+  };
+  // GetDigits — collects DTMF keypad input (for PINs/codes)
+  // The Say prompt plays INSIDE the GetDigits element
+  getDigits?: {
+    timeout: number; // seconds to wait for first digit
+    numDigits?: number; // auto-submit after this many digits (no # needed)
+    finishOnKey?: string; // key to end collection (e.g. "#")
+    callbackUrl: string; // receives POST with dtmfDigits
+    promptText: string; // <Say> prompt spoken inside <GetDigits>
   };
 }
 
