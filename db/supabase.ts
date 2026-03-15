@@ -12,7 +12,11 @@
  */
 
 import { ENV } from "../config/env.ts";
-import { UserProfile, ConversationTurn } from "../types/voice.ts";
+import {
+  UserProfile,
+  ConversationTurn,
+  InboundSession,
+} from "../types/voice.ts";
 
 // ─── PHONE NORMALISATION ──────────────────────────────────────────────────────
 
@@ -474,6 +478,69 @@ export async function saveConversationTurn(
 
 // ─── RECORDINGS ───────────────────────────────────────────────────────────────
 
+/**
+ * Upload audio bytes to Supabase Storage and return a permanent public URL.
+ *
+ * AT's at-internal.com URLs are temporary — their data retention policy means
+ * files can disappear. We download immediately and store in our own bucket.
+ *
+ * Bucket: call-recordings (create this in Supabase → Storage if it doesn't exist)
+ * Path:   {userId}/{sessionId}/{timestamp}.mp3
+ *
+ * Returns the permanent Supabase Storage URL, or falls back to the original
+ * AT URL if the upload fails (so we never lose the reference entirely).
+ */
+export async function uploadToSupabaseStorage(
+  audioBuffer: ArrayBuffer,
+  userId: string,
+  sessionId: string,
+  correlationId: string,
+  atRecordingUrl: string,
+): Promise<string> {
+  try {
+    const timestamp = Date.now();
+    const filename = `${userId}/${sessionId}/${timestamp}.mp3`;
+    const bucket = "call-recordings";
+
+    console.log(
+      `⬆️  [${correlationId}] Uploading ${(audioBuffer.byteLength / 1024).toFixed(1)}KB to Supabase Storage: ${filename}`,
+    );
+
+    const uploadResp = await fetch(
+      `${ENV.SUPABASE_URL}/storage/v1/object/${bucket}/${filename}`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
+          apikey: ENV.SUPABASE_SERVICE_KEY,
+          "Content-Type": "audio/mpeg",
+          "x-upsert": "true",
+        },
+        body: audioBuffer,
+      },
+    );
+
+    if (!uploadResp.ok) {
+      const err = await uploadResp.text();
+      console.error(
+        `❌ [${correlationId}] Storage upload failed: ${uploadResp.status} — ${err}`,
+      );
+      // Fall back to AT URL so we don't lose the reference
+      return atRecordingUrl;
+    }
+
+    // Build permanent public URL
+    const publicUrl = `${ENV.SUPABASE_URL}/storage/v1/object/public/${bucket}/${filename}`;
+    console.log(
+      `✅ [${correlationId}] Uploaded to Supabase Storage: ${publicUrl}`,
+    );
+    return publicUrl;
+  } catch (err) {
+    console.error(`❌ [${correlationId}] Storage upload exception:`, err);
+    return atRecordingUrl; // graceful fallback
+  }
+}
+
 export async function saveRecording(
   sessionId: string,
   userId: string,
@@ -546,5 +613,124 @@ export async function logEvent(
     });
   } catch (error) {
     console.error(`❌ [${correlationId}] Log event error:`, error);
+  }
+}
+
+// ─── SESSION REBUILD (Deno isolate fallback) ─────────────────────────────────
+//
+// Deno Deploy runs across multiple isolates. activeSessions (in-memory Map) is
+// isolate-local, so /recording or /ai_thinking may land in a different isolate
+// from the one that created the session. This function reconstructs the session
+// from Supabase so every request can find it regardless of which isolate runs.
+
+export async function rebuildSessionFromDB(
+  sessionId: string,
+  correlationId: string,
+): Promise<InboundSession | null> {
+  try {
+    console.log(
+      `🔄 [${correlationId}] Rebuilding session from DB: ${sessionId}`,
+    );
+
+    // 1. Fetch inbound_session row
+    const sessResp = await fetch(
+      `${ENV.SUPABASE_URL}/rest/v1/inbound_sessions?session_id=eq.${encodeURIComponent(sessionId)}&select=*&limit=1`,
+      {
+        headers: {
+          apikey: ENV.SUPABASE_SERVICE_KEY,
+          Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
+        },
+      },
+    );
+    if (!sessResp.ok) return null;
+    const sessRows = await sessResp.json();
+    if (!sessRows.length) {
+      console.error(
+        `❌ [${correlationId}] No inbound_session row for ${sessionId}`,
+      );
+      return null;
+    }
+    const sessRow = sessRows[0];
+
+    // 2. Fetch user profile
+    const profile = await fetchProfileById(sessRow.user_id, correlationId);
+    if (!profile) {
+      console.error(
+        `❌ [${correlationId}] No profile for user ${sessRow.user_id}`,
+      );
+      return null;
+    }
+    const userProfile = await mapProfileToUserProfile(
+      profile,
+      sessRow.call_code || "",
+    );
+
+    // 3. Fetch conversation turns (last 20, ordered)
+    const turnsResp = await fetch(
+      `${ENV.SUPABASE_URL}/rest/v1/conversation_turns?session_id=eq.${encodeURIComponent(sessionId)}&order=created_at.asc&limit=20&select=role,content,question_id,created_at`,
+      {
+        headers: {
+          apikey: ENV.SUPABASE_SERVICE_KEY,
+          Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
+        },
+      },
+    );
+    const turnsRows: {
+      role: string;
+      content: string;
+      question_id?: string;
+      created_at: string;
+    }[] = turnsResp.ok ? await turnsResp.json() : [];
+
+    const conversationHistory: ConversationTurn[] = turnsRows.map((t) => ({
+      role: t.role as "veda" | "user",
+      content: t.content,
+      timestamp: t.created_at,
+      questionId: t.question_id,
+    }));
+
+    // 4. Fetch global question progress
+    const globalQuestionsAsked = await getUserQuestionProgress(
+      sessRow.user_id,
+      correlationId,
+    );
+
+    // 5. Derive sessionQuestionsAsked from conversation history
+    const sessionQuestionsAsked = conversationHistory
+      .filter((t) => t.role === "veda" && t.questionId)
+      .map((t) => t.questionId!)
+      .filter((id, i, arr) => arr.indexOf(id) === i);
+
+    // 6. Find current question (last Veda question in history)
+    const lastVedaQuestion = [...conversationHistory]
+      .reverse()
+      .find((t) => t.role === "veda" && t.questionId);
+
+    const session: InboundSession = {
+      sessionId,
+      userId: sessRow.user_id,
+      userProfile,
+      callerPhone: sessRow.caller_phone || "",
+      phase: "conversation",
+      conversationHistory,
+      sessionQuestionsAsked,
+      globalQuestionsAsked,
+      currentQuestionId: lastVedaQuestion?.questionId || null,
+      followUpCount: 0, // conservatively reset — better than crashing
+      pendingRecordingUrl: null,
+      pendingTurnIndex: turnsRows.filter((t) => t.role === "user").length,
+      pendingQuestionId: lastVedaQuestion?.questionId || "",
+      startedAt: sessRow.created_at || new Date().toISOString(),
+      lastActivity: new Date().toISOString(),
+      identifiedViaPhone: sessRow.identified_via_phone || false,
+    };
+
+    console.log(
+      `✅ [${correlationId}] Session rebuilt: ${userProfile.name}, ${conversationHistory.length} turns, ${sessionQuestionsAsked.length} questions`,
+    );
+    return session;
+  } catch (error) {
+    console.error(`❌ [${correlationId}] rebuildSessionFromDB error:`, error);
+    return null;
   }
 }

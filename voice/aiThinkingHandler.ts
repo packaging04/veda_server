@@ -28,6 +28,8 @@ import {
   lookupUserByCode,
   logEvent,
   saveRecording,
+  rebuildSessionFromDB,
+  uploadToSupabaseStorage,
 } from "../db/supabase.ts";
 import { buildVoiceXML } from "./voiceXml.ts";
 import { transcribeAudio } from "../background/transcription.ts";
@@ -62,9 +64,26 @@ export async function handleAIThinking(
 
     if (!sessionId) return errorResponse();
 
-    const session = activeSessions.get(sessionId);
+    // Try memory first (fast), fall back to Supabase rebuild (handles Deno isolate separation)
+    let session = activeSessions.get(sessionId);
     if (!session) {
-      console.error(`❌ [${correlationId}] Session not found: ${sessionId}`);
+      console.warn(
+        `⚠️  [${correlationId}] Session not in memory — rebuilding from Supabase`,
+      );
+      session =
+        (await rebuildSessionFromDB(sessionId, correlationId)) ?? undefined;
+      if (session) {
+        activeSessions.set(sessionId, session); // cache for this isolate going forward
+        console.log(
+          `✅ [${correlationId}] Session restored: ${session.userProfile?.name}`,
+        );
+      }
+    }
+
+    if (!session) {
+      console.error(
+        `❌ [${correlationId}] Session not found in memory or DB: ${sessionId}`,
+      );
       return errorResponse();
     }
 
@@ -123,6 +142,18 @@ export async function handleAIThinking(
       );
     }
 
+    // ── Upload to Supabase Storage (permanent) ─────────────────────────────────
+    // AT's at-internal.com URLs are temporary. Upload immediately after download
+    // so we own the file. Falls back to AT URL gracefully if upload fails.
+    // This runs before Whisper so the upload overlaps with transcription time.
+    const permanentUrl = await uploadToSupabaseStorage(
+      audioBuffer,
+      session.userId,
+      sessionId,
+      correlationId,
+      recordingUrl,
+    );
+
     // ── Transcribe ─────────────────────────────────────────────────────────────
     const transcript = await transcribeAudio(audioBuffer, correlationId);
     console.log(
@@ -144,7 +175,7 @@ export async function handleAIThinking(
             record: {
               maxLength: ENV.RECORDING_MAX_LENGTH_SECONDS,
               timeout: ENV.RECORDING_TIMEOUT_SECONDS,
-              finishOnKey: "#",
+              // No finishOnKey — AT treats # during Record as call termination
               trimSilence: true,
               playBeep: false,
               callbackUrl: `${ENV.BASE_URL}/recording?sessionId=${sessionId}&phase=conversation&questionId=${questionId}&turnIndex=${turnIndex}`,
@@ -161,7 +192,7 @@ export async function handleAIThinking(
       content: transcript,
       timestamp: new Date().toISOString(),
       questionId,
-      audioUrl: recordingUrl,
+      audioUrl: permanentUrl, // permanent Supabase URL, not temporary AT URL
     };
     session.conversationHistory.push(userTurn);
     session.lastActivity = new Date().toISOString();
@@ -180,7 +211,7 @@ export async function handleAIThinking(
       questionId,
       `Q${turnIndex + 1}`,
       turnIndex,
-      recordingUrl,
+      permanentUrl,
       "",
       durationSeconds,
       audioBuffer.byteLength,
@@ -241,22 +272,8 @@ export async function handleAIThinking(
     console.log(`⚡ [${correlationId}] Total processing: ${totalMs}ms`);
 
     const nextTurnIndex = turnIndex + 1;
-
-    // Append hash reminder — this is how the user signals they are done speaking.
-    // Keep it short and consistent so it becomes muscle memory after the first turn.
-    const hashReminder =
-      turnIndex === 0
-        ? " Take as long as you need — and press the hash key when you're finished."
-        : " Press hash when you're done.";
-
     const actions: AfricasTalkingAction[] = [
-      {
-        say: {
-          text: decision.speech + hashReminder,
-          voice: "woman",
-          playBeep: false,
-        },
-      },
+      { say: { text: decision.speech, voice: "woman", playBeep: false } },
     ];
 
     if (decision.action === "end_session") {
@@ -294,7 +311,9 @@ export async function handleAIThinking(
       record: {
         maxLength: ENV.RECORDING_MAX_LENGTH_SECONDS,
         timeout: ENV.RECORDING_TIMEOUT_SECONDS,
-        finishOnKey: "#",
+        // NOTE: No finishOnKey — in Africa's Talking, pressing # during <Record>
+        // terminates the entire call instead of triggering the callbackUrl.
+        // Silence detection (timeout) is the correct end-of-speech trigger for AT.
         trimSilence: true,
         playBeep: false,
         callbackUrl: `${ENV.BASE_URL}/recording?sessionId=${sessionId}&phase=conversation&questionId=${nextQuestionId}&turnIndex=${nextTurnIndex}`,
@@ -469,20 +488,12 @@ export async function deliverGreetingAndFirstQuestion(
   return new Response(
     buildVoiceXML([
       { say: { text: greetingText, voice: "woman", playBeep: false } },
-      {
-        say: {
-          text:
-            firstQ.speech +
-            " Take as long as you need — and press the hash key when you're finished.",
-          voice: "woman",
-          playBeep: false,
-        },
-      },
+      { say: { text: firstQ.speech, voice: "woman", playBeep: false } },
       {
         record: {
           maxLength: ENV.RECORDING_MAX_LENGTH_SECONDS,
           timeout: ENV.RECORDING_TIMEOUT_SECONDS,
-          finishOnKey: "#",
+          // No finishOnKey — AT's # during Record ends the call, not a mid-call callback
           trimSilence: true,
           playBeep: false,
           callbackUrl: `${ENV.BASE_URL}/recording?sessionId=${sessionId}&phase=conversation&questionId=${firstQ.questionId}&turnIndex=0`,

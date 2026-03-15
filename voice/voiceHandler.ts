@@ -8,6 +8,7 @@ import {
   getUserQuestionProgress,
   saveConversationTurn,
   saveRecording,
+  uploadToSupabaseStorage,
 } from "../db/supabase.ts";
 import { buildVoiceXML } from "./voiceXml.ts";
 import { sanitizePhoneNumber } from "../security/helpers.ts";
@@ -260,6 +261,15 @@ async function processCallCompletionRecording(
       `✅ [${correlationId}] Completion recording downloaded: ${(audioBuffer.byteLength / 1024).toFixed(1)}KB`,
     );
 
+    // Upload to Supabase Storage immediately — AT URLs are temporary
+    const permanentUrl = await uploadToSupabaseStorage(
+      audioBuffer,
+      session.userId,
+      sessionId,
+      correlationId,
+      recordingUrl, // AT URL as fallback
+    );
+
     // Transcribe
     const transcript = await transcribeAudio(audioBuffer, correlationId);
     console.log(
@@ -279,23 +289,24 @@ async function processCallCompletionRecording(
         content: transcript,
         timestamp: new Date().toISOString(),
         questionId,
-        audioUrl: recordingUrl,
+        audioUrl: permanentUrl,
       },
       correlationId,
     );
 
-    // Save recording record
+    // Save recording record with permanent Supabase URL
     await saveRecording(
       sessionId,
       session.userId,
       questionId,
       `Question ${session.sessionQuestionsAsked.length}`,
       session.sessionQuestionsAsked.length,
-      recordingUrl,
+      permanentUrl,
       "",
       durationSeconds,
       audioBuffer.byteLength,
       correlationId,
+      transcript,
     );
 
     console.log(
