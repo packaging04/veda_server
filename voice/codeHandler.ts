@@ -21,10 +21,15 @@ import {
   createInboundSession,
   getUserQuestionProgress,
   logEvent,
+  saveRecording,
+  saveConversationTurn,
+  uploadToSupabaseStorage,
+  updateInboundSessionStatus,
 } from "../db/supabase.ts";
 import { buildVoiceXML } from "./voiceXml.ts";
 import { deliverGreetingAndFirstQuestion } from "./aiThinkingHandler.ts";
 import { AfricasTalkingAction } from "../types/voice.ts";
+import { transcribeAudio } from "../background/transcription.ts";
 
 export async function handleCodeCallback(
   req: Request,
@@ -39,12 +44,62 @@ export async function handleCodeCallback(
     for (const [k, v] of formData.entries()) fields[k] = v.toString();
     console.log(`🔢 [${correlationId}] /code fields:`, JSON.stringify(fields));
 
-    const dtmfDigits = ((formData.get("dtmfDigits") as string) || "").trim();
+    const isActive = formData.get("isActive") as string;
     const sessionId =
       url.searchParams.get("sessionId") ||
       (formData.get("sessionId") as string);
     const isRetry = url.searchParams.get("retry") === "1";
 
+    // ── Call completion event ─────────────────────────────────────────────────
+    // AT sends the final completion event back to the last URL that responded
+    // with XML — which is /code after PIN verification. Handle it here so the
+    // recordingUrl is never silently dropped.
+    if (isActive === "0") {
+      const recordingUrl = formData.get("recordingUrl") as string | null;
+      const durationSeconds = parseInt(
+        (formData.get("durationInSeconds") as string) || "0",
+      );
+
+      console.log(
+        `📞 [${correlationId}] /code completion event — duration=${durationSeconds}s, recordingUrl=${recordingUrl ? "PRESENT" : "none"}`,
+      );
+
+      if (recordingUrl && sessionId) {
+        const session = activeSessions.get(sessionId);
+
+        // Process in background — respond to AT immediately (no timeout risk)
+        processCodeCompletionRecording(
+          recordingUrl,
+          durationSeconds,
+          sessionId,
+          session?.userId || "",
+          session?.currentQuestionId || null,
+          session?.sessionQuestionsAsked?.length || 0,
+          correlationId,
+        ).catch((e) =>
+          console.error(
+            `❌ [${correlationId}] Code completion recording error:`,
+            e,
+          ),
+        );
+
+        if (session) {
+          await updateInboundSessionStatus(
+            sessionId,
+            "completed",
+            session.sessionQuestionsAsked.length,
+            correlationId,
+          );
+          activeSessions.delete(sessionId);
+        }
+      } else {
+        console.log(`📞 [${correlationId}] /code completion — no recordingUrl`);
+      }
+
+      return new Response("", { status: 200 });
+    }
+
+    const dtmfDigits = ((formData.get("dtmfDigits") as string) || "").trim();
     console.log(
       `🔢 [${correlationId}] PIN entered: "${dtmfDigits}" for session: ${sessionId}`,
     );
@@ -218,5 +273,110 @@ async function getSessionCount(
     return rows.length + 1;
   } catch {
     return 1;
+  }
+}
+
+// ─── Background: process recording from call completion event ─────────────────
+// Runs non-blocking after we've already returned 200 to AT.
+// Same pattern as processCallCompletionRecording in voiceHandler.ts.
+
+async function processCodeCompletionRecording(
+  atRecordingUrl: string,
+  durationSeconds: number,
+  sessionId: string,
+  userId: string,
+  questionId: string | null,
+  turnIndex: number,
+  correlationId: string,
+): Promise<void> {
+  console.log(
+    `📼 [${correlationId}] Processing /code completion recording for session ${sessionId}`,
+  );
+
+  try {
+    // Download from AT's temporary URL
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    const audioResp = await fetch(atRecordingUrl, {
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!audioResp.ok) {
+      console.error(
+        `❌ [${correlationId}] Recording download failed: ${audioResp.status}`,
+      );
+      return;
+    }
+
+    const audioBuffer = await audioResp.arrayBuffer();
+    console.log(
+      `✅ [${correlationId}] Downloaded ${(audioBuffer.byteLength / 1024).toFixed(1)}KB`,
+    );
+
+    // Upload to Supabase Storage immediately — AT URLs are temporary
+    const permanentUrl = await uploadToSupabaseStorage(
+      audioBuffer,
+      userId,
+      sessionId,
+      correlationId,
+      atRecordingUrl,
+    );
+
+    // Transcribe
+    const transcript = await transcribeAudio(audioBuffer, correlationId);
+    console.log(
+      `📝 [${correlationId}] Transcript: "${transcript.substring(0, 120)}"`,
+    );
+
+    if (!transcript.trim()) {
+      console.log(
+        `⚠️  [${correlationId}] Empty transcript — saving recording without text`,
+      );
+    }
+
+    const qId = questionId || "unknown";
+
+    // Save conversation turn if we have a transcript
+    if (transcript.trim() && userId) {
+      await saveConversationTurn(
+        sessionId,
+        userId,
+        {
+          role: "user",
+          content: transcript,
+          timestamp: new Date().toISOString(),
+          questionId: qId,
+          audioUrl: permanentUrl,
+        },
+        correlationId,
+      );
+    }
+
+    // Always save the recording row — even without transcript
+    if (userId) {
+      await saveRecording(
+        sessionId,
+        userId,
+        qId,
+        `Session recording (turn ${turnIndex + 1})`,
+        turnIndex,
+        permanentUrl,
+        "",
+        durationSeconds,
+        audioBuffer.byteLength,
+        correlationId,
+        transcript || undefined,
+      );
+    }
+
+    console.log(
+      `✅ [${correlationId}] /code completion recording saved — url: ${permanentUrl.substring(0, 60)}...`,
+    );
+  } catch (err) {
+    console.error(
+      `❌ [${correlationId}] processCodeCompletionRecording error:`,
+      err,
+    );
   }
 }
