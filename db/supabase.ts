@@ -616,6 +616,33 @@ export async function logEvent(
   }
 }
 
+/**
+ * Lightweight lookup — returns just the user_id for a given AT sessionId.
+ * Used as a fallback when the in-memory session has been lost (isolate restart).
+ */
+export async function getUserIdBySessionId(
+  sessionId: string,
+  correlationId: string,
+): Promise<string | null> {
+  try {
+    const resp = await fetch(
+      `${ENV.SUPABASE_URL}/rest/v1/inbound_sessions?session_id=eq.${encodeURIComponent(sessionId)}&select=user_id&limit=1`,
+      {
+        headers: {
+          apikey: ENV.SUPABASE_SERVICE_KEY,
+          Authorization: `Bearer ${ENV.SUPABASE_SERVICE_KEY}`,
+        },
+      },
+    );
+    if (!resp.ok) return null;
+    const rows = await resp.json();
+    return rows[0]?.user_id || null;
+  } catch (err) {
+    console.error(`❌ [${correlationId}] getUserIdBySessionId error:`, err);
+    return null;
+  }
+}
+
 // ─── SESSION REBUILD (Deno isolate fallback) ─────────────────────────────────
 //
 // Deno Deploy runs across multiple isolates. activeSessions (in-memory Map) is

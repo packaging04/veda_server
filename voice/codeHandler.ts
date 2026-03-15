@@ -25,6 +25,7 @@ import {
   saveConversationTurn,
   uploadToSupabaseStorage,
   updateInboundSessionStatus,
+  getUserIdBySessionId,
 } from "../db/supabase.ts";
 import { buildVoiceXML } from "./voiceXml.ts";
 import { deliverGreetingAndFirstQuestion } from "./aiThinkingHandler.ts";
@@ -67,21 +68,34 @@ export async function handleCodeCallback(
       if (recordingUrl && sessionId) {
         const session = activeSessions.get(sessionId);
 
-        // Process in background — respond to AT immediately (no timeout risk)
-        processCodeCompletionRecording(
-          recordingUrl,
-          durationSeconds,
-          sessionId,
-          session?.userId || "",
-          session?.currentQuestionId || null,
-          session?.sessionQuestionsAsked?.length || 0,
-          correlationId,
-        ).catch((e) =>
-          console.error(
-            `❌ [${correlationId}] Code completion recording error:`,
-            e,
-          ),
-        );
+        // If session isn't in memory (Deno isolate restart), look up userId
+        // from inbound_sessions table — otherwise FK constraint rejects the insert
+        const userId =
+          session?.userId ||
+          (await getUserIdBySessionId(sessionId, correlationId)) ||
+          "";
+
+        if (!userId) {
+          console.warn(
+            `⚠️  [${correlationId}] Could not resolve userId for session ${sessionId} — recording will be skipped`,
+          );
+        } else {
+          // Process in background — respond to AT immediately (no timeout risk)
+          processCodeCompletionRecording(
+            recordingUrl,
+            durationSeconds,
+            sessionId,
+            userId,
+            session?.currentQuestionId || null,
+            session?.sessionQuestionsAsked?.length || 0,
+            correlationId,
+          ).catch((e) =>
+            console.error(
+              `❌ [${correlationId}] Code completion recording error:`,
+              e,
+            ),
+          );
+        }
 
         if (session) {
           await updateInboundSessionStatus(
