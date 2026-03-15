@@ -3,7 +3,6 @@ import { handleVoiceCallback } from "./voice/voiceHandler.ts";
 import { handleRecordingCallback } from "./voice/recordingHandler.ts";
 import { handleAIThinking } from "./voice/aiThinkingHandler.ts";
 import { handleCodeCallback } from "./voice/codeHandler.ts";
-import { handleTestRecording } from "./voice/testRecordingHandler.ts";
 import { activeSessions } from "./voice/sessionStore.ts";
 
 Deno.serve(async (req: Request) => {
@@ -48,12 +47,6 @@ Deno.serve(async (req: Request) => {
 
   // POST /code — AT sends DTMF digits here after <GetDigits> finishes
   // Instant PIN lookup — no audio, no Whisper, responds in < 500ms
-  // GET /test-recording — verifies full pipeline: AT download → Storage upload → DB insert
-  // REMOVE THIS ROUTE after confirming the pipeline works
-  if (req.method === "GET" && url.pathname === "/test-recording") {
-    return handleTestRecording(req, correlationId);
-  }
-
   if (req.method === "POST" && url.pathname === "/code") {
     return handleCodeCallback(req, correlationId);
   }
