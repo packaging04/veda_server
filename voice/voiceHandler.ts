@@ -9,6 +9,7 @@ import {
   saveConversationTurn,
   saveRecording,
   uploadToSupabaseStorage,
+  getUserIdBySessionId,
 } from "../db/supabase.ts";
 import { buildVoiceXML } from "./voiceXml.ts";
 import { sanitizePhoneNumber } from "../security/helpers.ts";
@@ -91,25 +92,45 @@ export async function handleVoiceCallback(
 
         activeSessions.delete(sessionId);
       } else {
-        // Session not in memory (e.g. isolate restart) — still log it
+        // Session not in memory (isolate restart) — reconstruct userId from DB
+        // and run the full recording pipeline so nothing is lost
         console.warn(
           `⚠️  [${correlationId}] Session ${sessionId} not in memory at call end`,
         );
         if (recordingUrl) {
-          console.log(
-            `📼 [${correlationId}] Recording URL (no session): ${recordingUrl}`,
-          );
-          // Save a minimal record so we don't lose it
-          await logEvent(
-            sessionId,
-            "orphaned_recording",
-            {
-              recording_url: recordingUrl,
-              duration_seconds: durationInSeconds,
-              caller: callerNumber,
-            },
-            correlationId,
-          );
+          const userId = await getUserIdBySessionId(sessionId, correlationId);
+          if (userId) {
+            console.log(
+              `🔄 [${correlationId}] Recovered userId=${userId} for orphaned session — processing recording`,
+            );
+            processOrphanedRecording(
+              recordingUrl,
+              durationInSeconds,
+              sessionId,
+              userId,
+              correlationId,
+            ).catch((e) =>
+              console.error(
+                `❌ [${correlationId}] Orphaned recording error:`,
+                e,
+              ),
+            );
+          } else {
+            // Can't recover userId — log to call_logs as last resort
+            console.warn(
+              `⚠️  [${correlationId}] Could not recover userId — logging orphaned recording`,
+            );
+            await logEvent(
+              sessionId,
+              "orphaned_recording",
+              {
+                recording_url: recordingUrl,
+                duration_seconds: durationInSeconds,
+                caller: callerNumber,
+              },
+              correlationId,
+            );
+          }
         }
       }
 
@@ -270,8 +291,28 @@ async function processCallCompletionRecording(
       recordingUrl, // AT URL as fallback
     );
 
-    // Transcribe
-    const transcript = await transcribeAudio(audioBuffer, correlationId);
+    // Transcribe with retry on 429 rate limit
+    let transcript = "";
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        transcript = await transcribeAudio(audioBuffer, correlationId);
+        break;
+      } catch (err: any) {
+        if (err?.message?.includes("429") && attempt < 3) {
+          const wait = attempt * 5000;
+          console.warn(
+            `⚠️  [${correlationId}] Whisper 429 — retrying in ${wait / 1000}s (attempt ${attempt}/3)`,
+          );
+          await new Promise((r) => setTimeout(r, wait));
+        } else {
+          console.error(
+            `❌ [${correlationId}] Whisper failed after ${attempt} attempts:`,
+            err,
+          );
+          break;
+        }
+      }
+    }
     console.log(
       `📝 [${correlationId}] Completion transcript: "${transcript.substring(0, 100)}"`,
     );
@@ -384,4 +425,93 @@ function errorResponse(message: string): Response {
     ]),
     { status: 200, headers: { "Content-Type": "text/xml" } },
   );
+}
+
+// ─── Orphaned recording pipeline ─────────────────────────────────────────────
+// Runs when session isn't in memory (Deno isolate restart).
+// Recovers userId from DB, downloads audio, uploads to Storage, saves row.
+
+async function processOrphanedRecording(
+  atRecordingUrl: string,
+  durationSeconds: number,
+  sessionId: string,
+  userId: string,
+  correlationId: string,
+): Promise<void> {
+  console.log(
+    `📼 [${correlationId}] Processing orphaned recording — session ${sessionId}`,
+  );
+  try {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    const audioResp = await fetch(atRecordingUrl, {
+      signal: controller.signal,
+    });
+    clearTimeout(timeoutId);
+
+    if (!audioResp.ok) {
+      console.error(
+        `❌ [${correlationId}] Orphaned download failed: ${audioResp.status}`,
+      );
+      return;
+    }
+
+    const audioBuffer = await audioResp.arrayBuffer();
+    console.log(
+      `✅ [${correlationId}] Orphaned download: ${(audioBuffer.byteLength / 1024).toFixed(1)}KB`,
+    );
+
+    // Upload to permanent storage
+    const permanentUrl = await uploadToSupabaseStorage(
+      audioBuffer,
+      userId,
+      sessionId,
+      correlationId,
+      atRecordingUrl,
+    );
+
+    // Transcribe with retry on 429
+    let transcript = "";
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        transcript = await transcribeAudio(audioBuffer, correlationId);
+        break;
+      } catch (err: any) {
+        if (err?.message?.includes("429") && attempt < 3) {
+          const wait = attempt * 5000;
+          console.warn(
+            `⚠️  [${correlationId}] Whisper 429 — retrying in ${wait / 1000}s (attempt ${attempt}/3)`,
+          );
+          await new Promise((r) => setTimeout(r, wait));
+        } else {
+          console.error(
+            `❌ [${correlationId}] Whisper failed after ${attempt} attempts:`,
+            err,
+          );
+          break;
+        }
+      }
+    }
+
+    // Save recording row — even without transcript
+    await saveRecording(
+      sessionId,
+      userId,
+      "orphaned",
+      "Wisdom Session",
+      0,
+      permanentUrl,
+      "",
+      durationSeconds,
+      audioBuffer.byteLength,
+      correlationId,
+      transcript || undefined,
+    );
+
+    console.log(
+      `✅ [${correlationId}] Orphaned recording saved — url: ${permanentUrl.substring(0, 60)}...`,
+    );
+  } catch (err) {
+    console.error(`❌ [${correlationId}] processOrphanedRecording error:`, err);
+  }
 }
